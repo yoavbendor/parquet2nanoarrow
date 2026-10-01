@@ -135,7 +135,12 @@ bool valid_utf8(std::string_view s) {
   const auto* p = reinterpret_cast<const unsigned char*>(s.data());
   const auto* e = p + s.size();
   while (p < e) {
-    if (e - p >= 8) {  // ASCII fast path
+    if (e - p >= 16) {  // ASCII fast path: 16 bytes per step
+      std::uint64_t w0, w1;
+      std::memcpy(&w0, p, 8);
+      std::memcpy(&w1, p + 8, 8);
+      if (!((w0 | w1) & 0x8080808080808080ull)) { p += 16; continue; }
+    } else if (e - p >= 8) {
       std::uint64_t w;
       std::memcpy(&w, p, 8);
       if (!(w & 0x8080808080808080ull)) { p += 8; continue; }
@@ -256,6 +261,9 @@ class chunk_decoder {
   status init_output() {
     if (l_.kind == conv::null) return ok();  // the null type has no buffers
     validity_ = ArrowArrayValidityBitmap(out_);
+    use_pool(&validity_->buffer);
+    use_pool(ArrowArrayBuffer(out_, 1));
+    if (l_.kind == conv::binary) use_pool(ArrowArrayBuffer(out_, 2));
     if (ArrowBitmapReserve(validity_, cap_) != NANOARROW_OK) return fail("out of memory");
     if (cap_ > 0) std::memset(validity_->buffer.data, 0xff, std::size_t((cap_ + 7) / 8));
     data_ = ArrowArrayBuffer(out_, 1);
@@ -321,6 +329,15 @@ class chunk_decoder {
         p += len;
         dict_off_.push_back(dict_data_.size());
       }
+      if (opt_.validate_utf8 && l_.format == "u") {
+        // check the dictionary ONCE: lookups into it never need re-checking
+        const std::string_view all(reinterpret_cast<const char*>(dict_data_.data()), dict_data_.size());
+        if (!valid_utf8(all)) return fail("invalid UTF-8 in the dictionary of string column '" + l_.name + "'");
+        for (std::size_t i = 0; i < n; ++i)
+          if (dict_off_[i] < dict_data_.size() && (std::uint8_t(dict_data_[dict_off_[i]]) & 0xc0) == 0x80)
+            return fail("invalid UTF-8 in the dictionary of string column '" + l_.name + "'");
+      }
+      dict_data_.resize(dict_data_.size() + kSlack);  // readable slack for fixed 16-byte copies
     } else {
       const std::size_t w = l_.phys_width;
       if (n > page.size() / w) return fail("dictionary entry count exceeds the page");
@@ -898,10 +915,34 @@ class chunk_decoder {
     }
   }
 
+  static constexpr std::size_t kSlack = 16;
+
+  /// Copy one value: a short value with 16 readable bytes behind it moves as one fixed 16-byte copy
+  /// (the output carries kSlack writable bytes), anything else as an ordinary memcpy.
+  static void copy_value(std::byte* dst, const std::byte* src, std::size_t len, const std::byte* src_end) {
+    if (len <= 16 && src_end - src >= 16) std::memcpy(dst, src, 16);
+    else if (len) std::memcpy(dst, src, len);
+  }
+
+  /// UTF-8 for the bytes this page appended, in one pass: the concatenation must be valid and every
+  /// value must start on a character boundary (then each value is valid on its own).
+  status check_utf8_page(std::int64_t from, std::int64_t to, std::size_t n) const {
+    const auto* d = reinterpret_cast<const std::byte*>(bdata_->data);
+    if (!valid_utf8(std::string_view(reinterpret_cast<const char*>(d) + from, std::size_t(to - from))))
+      return fail("invalid UTF-8 in string column '" + l_.name + "'");
+    const auto* offs = reinterpret_cast<const std::int32_t*>(data_->data) + row_;
+    for (std::size_t r = 0; r < n; ++r) {
+      const std::int32_t o = offs[r];
+      if (o < to && (std::uint8_t(d[o]) & 0xc0) == 0x80)
+        return fail("invalid UTF-8 in string column '" + l_.name + "'");
+    }
+    return ok();
+  }
+
   status binaries(Encoding enc, bytes_span vals, std::size_t n, std::size_t nn) {
-    auto st = decode_views(enc, vals, nn);
-    if (!st) return st;
     if (l_.kind == conv::be_to_dec128) {  // DECIMAL stored as BYTE_ARRAY
+      auto st = decode_views(enc, vals, nn);
+      if (!st) return st;
       std::byte* dst = reinterpret_cast<std::byte*>(data_->data) + std::size_t(row_) * 16;
       std::size_t j = 0;
       for (std::size_t r = 0; r < n; ++r) {
@@ -912,25 +953,89 @@ class chunk_decoder {
       }
       return ok();
     }
-    std::size_t bytes = 0;
-    for (std::size_t i = 0; i < nn; ++i) bytes += views_[i].size();
     const bool utf8 = opt_.validate_utf8 && l_.format == "u";
-    if (bdata_->size_bytes + std::int64_t(bytes) > INT32_MAX)
-      return fail("column '" + l_.name + "' exceeds 2 GiB of data in one row group (large_string not supported yet)");
-    if (ArrowBufferReserve(bdata_, std::int64_t(bytes)) != NANOARROW_OK) return fail("out of memory");
     auto* offs = reinterpret_cast<std::int32_t*>(data_->data);
-    std::int32_t cur = offs[row_];
-    std::size_t j = 0;
-    for (std::size_t r = 0; r < n; ++r) {
-      if (valid(r)) {
-        const auto v = views_[j++];
-        if (utf8 && !valid_utf8(v)) return fail("invalid UTF-8 in string column '" + l_.name + "'");
-        if (!v.empty()) std::memcpy(bdata_->data + bdata_->size_bytes, v.data(), v.size());
-        bdata_->size_bytes += std::int64_t(v.size());
-        cur += std::int32_t(v.size());
+    const std::int64_t start = bdata_->size_bytes;
+    std::int64_t cur = start;
+    const auto too_big = [&] {
+      return fail("column '" + l_.name + "' exceeds 2 GiB of data in one row group (large_string not supported yet)");
+    };
+    switch (enc) {
+      case Encoding::PLAIN: {  // one pass: parse each length, copy, write the offset
+        if (ArrowBufferReserve(bdata_, std::int64_t(vals.size() + kSlack)) != NANOARROW_OK) return fail("out of memory");
+        std::byte* out = reinterpret_cast<std::byte*>(bdata_->data);
+        const std::byte* p = vals.data();
+        const std::byte* const e = p + vals.size();
+        for (std::size_t r = 0; r < n; ++r) {
+          if (valid(r)) {
+            if (e - p < 4) return fail("truncated PLAIN byte array");
+            const std::uint32_t len = le32(p);
+            p += 4;
+            if (len > std::size_t(e - p)) return fail("PLAIN byte array runs past the page");
+            copy_value(out + cur, p, len, e);
+            p += len;
+            cur += len;
+            if (cur > INT32_MAX) return too_big();
+          }
+          offs[row_ + std::int64_t(r) + 1] = std::int32_t(cur);
+        }
+        break;
       }
-      offs[row_ + std::int64_t(r) + 1] = cur;
+      case Encoding::PLAIN_DICTIONARY:
+      case Encoding::RLE_DICTIONARY: {  // indices first, then exact-size gather from the dictionary
+        if (!have_dict_) return fail("dictionary-encoded page without a dictionary page");
+        idx_.resize(nn);
+        if (nn) {
+          if (vals.empty()) return fail("dictionary indices missing");
+          const unsigned bw = std::uint8_t(vals[0]);
+          if (bw > 32) return fail("dictionary index bit width over 32");
+          col::rle_bp_decoder d(vals.subspan(1), bw);
+          if (d.get(idx_.data(), nn) != nn || !d.ok()) return fail("dictionary indices shorter than the page");
+        }
+        std::int64_t total = 0;
+        for (std::size_t i = 0; i < nn; ++i) {
+          if (idx_[i] >= dict_n_) return fail("dictionary index out of range");
+          total += std::int64_t(dict_off_[idx_[i] + 1] - dict_off_[idx_[i]]);
+        }
+        if (start + total > INT32_MAX) return too_big();
+        if (ArrowBufferReserve(bdata_, total + std::int64_t(kSlack)) != NANOARROW_OK) return fail("out of memory");
+        std::byte* out = reinterpret_cast<std::byte*>(bdata_->data);
+        const std::byte* dd = dict_data_.data();
+        const std::byte* const dend = dd + dict_data_.size();  // includes kSlack padding
+        std::size_t j = 0;
+        for (std::size_t r = 0; r < n; ++r) {
+          if (valid(r)) {
+            const std::size_t a = dict_off_[idx_[j]], len = dict_off_[idx_[j] + 1] - a;
+            ++j;
+            copy_value(out + cur, dd + a, len, dend);
+            cur += std::int64_t(len);
+          }
+          offs[row_ + std::int64_t(r) + 1] = std::int32_t(cur);
+        }
+        bdata_->size_bytes = cur;
+        return ok();  // the dictionary was UTF-8 checked once, when it was read
+      }
+      default: {  // DELTA_LENGTH_BYTE_ARRAY / DELTA_BYTE_ARRAY: through views
+        auto st = decode_views(enc, vals, nn);
+        if (!st) return st;
+        std::int64_t total = 0;
+        for (std::size_t i = 0; i < nn; ++i) total += std::int64_t(views_[i].size());
+        if (start + total > INT32_MAX) return too_big();
+        if (ArrowBufferReserve(bdata_, total + std::int64_t(kSlack)) != NANOARROW_OK) return fail("out of memory");
+        std::byte* out = reinterpret_cast<std::byte*>(bdata_->data);
+        std::size_t j = 0;
+        for (std::size_t r = 0; r < n; ++r) {
+          if (valid(r)) {
+            const auto v = views_[j++];
+            if (!v.empty()) std::memcpy(out + cur, v.data(), v.size());
+            cur += std::int64_t(v.size());
+          }
+          offs[row_ + std::int64_t(r) + 1] = std::int32_t(cur);
+        }
+      }
     }
+    bdata_->size_bytes = cur;
+    if (utf8) return check_utf8_page(start, cur, n);
     return ok();
   }
 
@@ -953,16 +1058,40 @@ class chunk_decoder {
 
   bool have_dict_ = false;
   std::size_t dict_n_ = 0;
-  std::vector<std::byte> dict_fixed_, dict_data_;
-  std::vector<std::size_t> dict_off_;
 
-  std::vector<std::byte> page_buf_, dense_;
-  std::vector<std::uint8_t> dense_bits_;
-  std::vector<std::uint32_t> levels_, level_buf_;
-  std::vector<std::uint8_t> pv_;  ///< page-local validity bits, padded to whole 64-bit words
-  std::vector<std::string_view> views_;
-  std::vector<std::int32_t> lengths_, prefix_;
-  std::vector<char> arena_;
+  // Scratch buffers live per thread and are reused across column chunks (grow-only, bounded by
+  // the largest page / dictionary seen): allocating them per chunk paid fresh page faults for every
+  // decompression buffer of every column of every row group. Decoding on one thread is strictly
+  // sequential, so one set per thread is enough; have_dict_ / dict_n_ above stay per chunk, so a
+  // previous chunk's dictionary contents can never be used.
+  struct scratch {
+    std::vector<std::byte> dict_fixed, dict_data, page_buf, dense;
+    std::vector<std::size_t> dict_off;
+    std::vector<std::uint8_t> dense_bits, pv;
+    std::vector<std::uint32_t> levels, level_buf, idx;
+    std::vector<std::string_view> views;
+    std::vector<std::int32_t> lengths, prefix;
+    std::vector<char> arena;
+  };
+  static scratch& thread_scratch() {
+    static thread_local scratch s;
+    return s;
+  }
+  scratch& s_ = thread_scratch();
+  std::vector<std::byte>& dict_fixed_ = s_.dict_fixed;
+  std::vector<std::byte>& dict_data_ = s_.dict_data;
+  std::vector<std::size_t>& dict_off_ = s_.dict_off;
+  std::vector<std::byte>& page_buf_ = s_.page_buf;
+  std::vector<std::byte>& dense_ = s_.dense;
+  std::vector<std::uint8_t>& dense_bits_ = s_.dense_bits;
+  std::vector<std::uint32_t>& levels_ = s_.levels;
+  std::vector<std::uint32_t>& level_buf_ = s_.level_buf;
+  std::vector<std::uint8_t>& pv_ = s_.pv;  ///< page-local validity bits, padded to whole 64-bit words
+  std::vector<std::string_view>& views_ = s_.views;
+  std::vector<std::int32_t>& lengths_ = s_.lengths;
+  std::vector<std::int32_t>& prefix_ = s_.prefix;
+  std::vector<std::uint32_t>& idx_ = s_.idx;
+  std::vector<char>& arena_ = s_.arena;
 };
 
 }  // namespace

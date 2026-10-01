@@ -33,7 +33,7 @@ endif()
 if(NOT TARGET nanom::nanom)
     FetchContent_Declare(nanom
         GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-        GIT_TAG 7f167fab40d849525f399e92a81cf928de67268b
+        GIT_TAG b96d1a46b233e8a4255893d22be41189951e8727
     )
     FetchContent_GetProperties(nanom)
     if(NOT nanom_POPULATED)
@@ -94,6 +94,7 @@ find_package(ZLIB QUIET)
 # --- library ---
 add_library(parquet2nanoarrow STATIC
     src/mapped_file.cpp
+    src/buffer_pool.cpp
     src/schema.cpp
     src/column_reader.cpp
     src/nested.cpp

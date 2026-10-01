@@ -302,6 +302,29 @@ def main():
             failures.append("unknown column did not fail")
         except RuntimeError:
             pass
+        # invalid UTF-8 must still be rejected after the move to bulk / once-per-dictionary checks.
+        # Uncompressed files are byte-patched in place (same lengths, so the file stays well formed).
+        def patched(name, values, find, repl, **cfg):
+            path = os.path.join(d, name)
+            pq.write_table(pa.table({"s": pa.array(values, pa.string())}), path, compression="none", **cfg)
+            raw = open(path, "rb").read()
+            assert raw.count(find) >= 1, name
+            open(path, "wb").write(raw.replace(find, repl))
+            return path
+        bad_plain = patched("bad_plain.parquet", ["hello", "world"] * 10, b"world", b"wor\xffd", use_dictionary=False)
+        # each value is invalid alone but the concatenation "\xc3\xa9" is valid: the per-value
+        # character-boundary check must catch it
+        bad_split = patched("bad_split.parquet", ["X", "Y"] * 10, b"\x01\x00\x00\x00X\x01\x00\x00\x00Y",
+                            b"\x01\x00\x00\x00\xc3\x01\x00\x00\x00\xa9", use_dictionary=False)
+        bad_dict = patched("bad_dict.parquet", ["hello", "world"] * 10, b"world", b"wor\xffd")
+        for path in (bad_plain, bad_split, bad_dict):
+            try:
+                lib.read(path)
+                failures.append(f"{os.path.basename(path)}: invalid UTF-8 was accepted")
+            except (RuntimeError, OSError) as e:  # open-time or stream-time (row group) error
+                if "UTF-8" not in str(e):
+                    failures.append(f"{os.path.basename(path)}: unexpected error {e}")
+
         # empty table
         epath = os.path.join(d, "empty.parquet")
         pq.write_table(make_table(rng, "none").slice(0, 0), epath)

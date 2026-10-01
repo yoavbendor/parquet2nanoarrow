@@ -21,6 +21,7 @@ namespace {
 
 status set_validity(ArrowArray* arr, const std::vector<std::uint8_t>& valid, std::int64_t len, std::int64_t nulls) {
   ArrowBitmap* vb = ArrowArrayValidityBitmap(arr);
+  use_pool(&vb->buffer);
   if (nulls == 0) {
     ArrowBitmapReset(vb);
   } else {
@@ -74,6 +75,7 @@ status build(const file& f, const anode& n, const std::vector<leaf_levels>& leve
 
   // list / map: offsets + validity, then the single child over the elements
   ArrowBuffer* ob = ArrowArrayBuffer(arr, 1);
+  use_pool(ob);
   if (ArrowBufferReserve(ob, (expected + 1) * 4) != NANOARROW_OK) return fail("out of memory");
   auto* offs = reinterpret_cast<std::int32_t*>(ob->data);
   std::int64_t elems = 0;

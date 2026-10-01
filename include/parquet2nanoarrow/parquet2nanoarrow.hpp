@@ -104,6 +104,12 @@ class reader {
   read_options options_;
 };
 
+/// Bound (in bytes) the memory kept for reuse by released output buffers (default 256 MiB; 0
+/// keeps nothing). Output buffers of 1 MiB and more come from anonymous mappings; when a
+/// consumer releases them they are kept, up to this limit, so later row groups reuse memory that
+/// is already faulted in. Lowering the limit returns the excess to the OS immediately.
+void set_buffer_pool_limit(std::size_t bytes);
+
 }  // namespace p2n
 
 #endif  // PARQUET2NANOARROW_HPP_INCLUDED

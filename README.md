@@ -56,7 +56,7 @@ table = pa.RecordBatchReader._import_from_c(int(ffi.cast("uintptr_t", stream))).
 - encrypted files;
 - reading the embedded `ARROW:schema`, so a timestamp's original non-UTC timezone and other
   Arrow-only type details are not restored;
-- multi-threaded decoding.
+- multi-threaded decoding (arrow-rs has none built in either; it is the next lever beyond parity).
 
 ## Safety
 
@@ -82,40 +82,43 @@ The file is untrusted input.
 
 ## Performance
 
-From `bench/compare_pyarrow.py`: 5,000,000 rows per file, single-threaded, warm page cache, on a
-shared 4-core cloud container (indicative, not a lab measurement). pyarrow is 25.0.
+Measured against [arrow-rs](https://github.com/apache/arrow-rs) (the Apache Arrow Rust `parquet`
+crate, 60.0.0) with `bench/parity.py`:
+- **Files:** 5,000,000 rows per file (nested: 1.25M), written by pyarrow.
+- **Settings:** both readers single-threaded, one batch per row group, glibc malloc.
+- **Warm:** best of 5 reads in one process, both with glibc tuned to keep freed memory.
+- **First read:** best of 3 fresh processes.
+- **Reported value:** the speedup (arrow-rs time ÷ parquet2nanoarrow time), averaged over 5 full
+  runs.
 
-| file | MB | p2n warm ms | pyarrow warm ms | speedup | p2n first read ms | pyarrow first read ms | speedup |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| nested: list<int64> + struct<int64,string>, snappy (1.25M rows) | 28 | 107.9 | 121.2 | 1.12x | 170.3 | 342.8 | 2.01x |
-| int64 x4, plain, uncompressed | 160 | 55.5 | 65.7 | 1.18x | 148.4 | 165.9 | 1.12x |
-| int64 x4, snappy | 160 | 215.8 | 207.9 | 0.96x | 302.1 | 311.6 | 1.03x |
-| float64 x4, zstd | 153 | 214.1 | 199.4 | 0.93x | 313.2 | 322.0 | 1.03x |
-| nullable int + double, snappy | 36 | 71.5 | 70.5 | 0.99x | 132.0 | 157.7 | 1.19x |
-| strings, dictionary, snappy | 58 | 297.9 | 402.4 | 1.35x | 387.2 | 507.9 | 1.31x |
-| strings, plain, zstd | 33 | 323.1 | 261.7 | 0.81x | 457.5 | 443.6 | 0.97x |
-| mixed, lz4_raw, page v2 | 67 | 182.5 | 214.7 | 1.18x | 275.6 | 349.2 | 1.27x |
+The target is at least 1.02x on every file, both ways.
 
-Ratios move by up to about 10% between runs in this environment, so treat a ratio within ±0.1 of 1.0
-as a tie.
+| file | warm, mean of 5 | first read, mean of 5 |
+|---|---:|---:|
+| nested: list<int64> + struct<int64,string>, snappy | 1.39x | 1.26x |
+| int64 x4, plain, uncompressed | 1.43x | 2.28x |
+| int64 x4, snappy | 1.05x | 1.43x |
+| float64 x4, zstd | 1.04x | 1.31x |
+| nullable int + double, snappy | 1.08x | 1.16x |
+| strings, dictionary, snappy | 1.12x | 1.37x |
+| strings, plain, zstd | 1.17x | 1.39x |
+| mixed, lz4_raw, page v2 | 1.15x | 1.46x |
 
-How to read the columns:
+All of this is from one shared 4-core cloud container, so treat it as indicative. Single runs vary by
+up to about ±5%. Three warm margins are thin: float64/zstd (one run at 0.99x), int64/snappy and nullable.
 
-- **warm** is the best of 5 in one process. pyarrow's mimalloc pool keeps freed memory mapped, so the
-  benchmark runs parquet2nanoarrow with glibc tuned to do the same.
-- **first read** is a fresh process for each library, so both pay for faulting in new output memory.
-- pyarrow with its thread pool is faster than both single-threaded columns.
-- The plain-strings row includes UTF-8 validation, which pyarrow does not do. With
-  `validate_utf8 = false` that file reads in 267 ms, ahead of pyarrow's 284 ms.
+What it rests on:
+- **Memory:** the input file is memory-mapped. Uncompressed pages are decoded straight from the
+  mapping, and PLAIN pages without levels are decompressed directly into the Arrow buffer.
+- **Levels:** definition levels become the validity bitmap run by run, and values are spread over
+  null slots 64 rows at a time.
+- **Strings:** a dictionary is UTF-8-checked once and PLAIN pages in one bulk pass. Strings are
+  copied in a single pass with fixed 16-byte moves.
+- **Codecs:** Snappy and LZ4 use table-driven decoding with wild-copy fast paths.
+- **Allocation:** output buffers come from a bounded reuse pool (`p2n::set_buffer_pool_limit`), so
+  later row groups don't fault fresh memory in again. Scratch buffers are reused per thread.
 
-How the reader keeps copies down:
-
-- the file is memory-mapped;
-- uncompressed pages are decoded straight from the mapping;
-- PLAIN pages without levels are decompressed directly into the Arrow buffer;
-- definition levels become the validity bitmap run by run;
-- values are spread over null slots 64 rows at a time;
-- bit-unpacking loops are specialized per bit width at compile time.
+`bench/compare_pyarrow.py` runs the same files against pyarrow.
 
 ## Build
 

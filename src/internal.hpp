@@ -130,6 +130,9 @@ class file {
 /// Resolve the leaf/top-level structure and Arrow mappings from the flattened Parquet schema.
 status build_schema(file& f);
 
+/// Route an (empty) output buffer's allocations through the pooled output allocator.
+void use_pool(ArrowBuffer* b);
+
 /// Arrow schema for an output node (recursively for nested types) into `out`.
 status node_arrow_schema(const file& f, const anode& n, ArrowSchema* out);
 
