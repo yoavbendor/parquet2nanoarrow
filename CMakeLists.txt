@@ -14,6 +14,7 @@ endif()
 
 option(P2N_BUILD_TESTS "Build parquet2nanoarrow tests, tools and benchmarks" ON)
 option(P2N_WERROR "Treat warnings as errors" OFF)
+option(P2N_PARQUET_TESTING "Fetch apache/parquet-testing (~8 MB) and check every file against pyarrow" ON)
 set(P2N_SANITIZER "" CACHE STRING "Sanitizers for the whole tree, e.g. address,undefined")
 
 if(NOT DEFINED FETCHCONTENT_BASE_DIR)
@@ -32,7 +33,7 @@ endif()
 if(NOT TARGET nanom::nanom)
     FetchContent_Declare(nanom
         GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-        GIT_TAG a496146a667decb5aae0cf1649bca1fc0ab8bd0b
+        GIT_TAG 7f167fab40d849525f399e92a81cf928de67268b
     )
     FetchContent_GetProperties(nanom)
     if(NOT nanom_POPULATED)
@@ -95,6 +96,7 @@ add_library(parquet2nanoarrow STATIC
     src/mapped_file.cpp
     src/schema.cpp
     src/column_reader.cpp
+    src/nested.cpp
     src/reader.cpp)
 add_library(parquet2nanoarrow::parquet2nanoarrow ALIAS parquet2nanoarrow)
 target_include_directories(parquet2nanoarrow PUBLIC
@@ -134,5 +136,20 @@ if(P2N_BUILD_TESTS)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/make_fuzz_seeds.py
                          $<TARGET_FILE:p2n_fuzz>)
         set_tests_properties(fuzz_corrupted_files PROPERTIES SKIP_RETURN_CODE 77)
+        if(P2N_PARQUET_TESTING)
+            # Real-world files from parquet-mr, Spark, Impala, Arrow, … incl. legacy list/map layouts.
+            FetchContent_Declare(parquet_testing
+                GIT_REPOSITORY https://github.com/apache/parquet-testing.git
+                GIT_TAG 56653c437c8092f704a092d0d1d4e600124cd49f
+            )
+            FetchContent_GetProperties(parquet_testing)
+            if(NOT parquet_testing_POPULATED)
+                FetchContent_Populate(parquet_testing)
+            endif()
+            add_test(NAME parquet_testing_corpus
+                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/parquet_testing.py
+                             $<TARGET_FILE:parquet2nanoarrow_c> ${parquet_testing_SOURCE_DIR})
+            set_tests_properties(parquet_testing_corpus PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
     endif()
 endif()

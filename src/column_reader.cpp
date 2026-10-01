@@ -46,6 +46,10 @@ std::uint32_t be32(const std::byte* p) {
 /// input (zero copy); everything else lands in `buf`.
 status decompress(CompressionCodec codec, bytes_span in, std::size_t out_size, std::vector<std::byte>& buf,
                   bytes_span& out) {
+  if (out_size == 0) {  // an empty page (e.g. a data page v2 holding only nulls): nothing to inflate
+    out = {};
+    return ok();
+  }
   if (codec == CompressionCodec::UNCOMPRESSED) {
     if (in.size() < out_size) return fail("uncompressed page shorter than its declared size");
     out = in.first(out_size);
@@ -101,8 +105,15 @@ status decompress(CompressionCodec codec, bytes_span in, std::size_t out_size, s
       zs.avail_in = uInt(std::min<std::size_t>(in.size(), UINT32_MAX));
       zs.next_out = reinterpret_cast<Bytef*>(buf.data());
       zs.avail_out = uInt(std::min<std::size_t>(buf.size(), UINT32_MAX));
-      const int rc = inflate(&zs, Z_FINISH);
-      const std::size_t produced = zs.total_out;
+      // a page may hold several concatenated gzip members: restart after each until the input or
+      // the declared output is used up
+      int rc = Z_OK;
+      for (;;) {
+        rc = inflate(&zs, Z_FINISH);
+        if (rc != Z_STREAM_END || zs.avail_in == 0 || zs.avail_out == 0) break;
+        if (inflateReset(&zs) != Z_OK) break;
+      }
+      const std::size_t produced = buf.size() - zs.avail_out;  // total_out restarts at each member
       inflateEnd(&zs);
       if (rc != Z_STREAM_END) return bad("gzip stream did not end where the page header says");
       if (produced != out_size) return bad("gzip: size differs from the page header");
@@ -164,35 +175,54 @@ void i64_to_dec128(std::int64_t v, std::byte* out) {
 
 class chunk_decoder {
  public:
-  chunk_decoder(const file& f, const leaf& l, const read_options& opt, ArrowArray* out, std::int64_t rows)
-      : f_(f), l_(l), opt_(opt), out_(out), rows_(rows) {}
+  chunk_decoder(const file& f, const leaf& l, const read_options& opt, ArrowArray* out, std::int64_t rows,
+                std::int16_t d_enc, leaf_levels* keep)
+      : f_(f), l_(l), opt_(opt), out_(out), rows_(rows), d_enc_(d_enc), keep_(keep) {}
 
   status run(const pq::ColumnChunk& chunk) {
     if (!chunk.meta_data->has_value()) return fail("column chunk without metadata (encrypted or external)");
     if (chunk.file_path->has_value()) return fail("column chunk stored in an external file is not supported");
     const pq::ColumnMetaData& md = **chunk.meta_data;
     if (*md.type != l_.physical) return fail("column chunk type differs from the schema");
-    if (*md.num_values != rows_)
-      return fail("column chunk holds " + std::to_string(*md.num_values) + " values for " +
-                  std::to_string(rows_) + " rows (flat column expected)");
+    target_ = *md.num_values;
+    if (target_ < 0) return fail("negative value count in column chunk");
+    if (!keep_) {
+      if (target_ != rows_)
+        return fail("column chunk holds " + std::to_string(target_) + " values for " + std::to_string(rows_) +
+                    " rows (flat column expected)");
+      cap_ = rows_;
+    } else {
+      // nested leaf: one level entry per value slot or empty/null ancestor; slots <= entries
+      if (target_ > opt_.max_row_group_rows)
+        return fail("column chunk declares " + std::to_string(target_) +
+                    " nested values, over read_options::max_row_group_rows");
+      cap_ = target_;
+      keep_->rep.reserve(std::size_t(target_));
+      keep_->def.reserve(std::size_t(target_));
+    }
     codec_ = *md.codec;
 
     std::int64_t start = *md.data_page_offset;
     if (md.dictionary_page_offset->has_value() && **md.dictionary_page_offset > 0 &&
         **md.dictionary_page_offset < start)
       start = **md.dictionary_page_offset;
-    const std::int64_t len = *md.total_compressed_size;
+    std::int64_t len = *md.total_compressed_size;
     const std::uint64_t fsize = f_.bytes.size();
     if (start < 0 || len < 0 || std::uint64_t(start) > fsize || std::uint64_t(len) > fsize - std::uint64_t(start))
       return fail("column chunk byte range lies outside the file");
+    // PARQUET-816: some writers left the dictionary page header out of total_compressed_size.
+    // Allow a bounded overrun (as Arrow does); pages are still bounds-checked against the file and
+    // decoding stops at the declared value count, so a well-formed chunk is unaffected.
+    len += std::int64_t(std::min<std::uint64_t>(100, fsize - std::uint64_t(start) - std::uint64_t(len)));
 
     auto st = init_output();
     if (!st) return st;
     const nanom::input whole = f_.input();
     nanom::input cur = whole.advance(std::size_t(start));
     cur = cur.with_range(cur.first, cur.first + len);
-    while (row_ < rows_) {
-      if (cur.empty()) return fail("column chunk ended after " + std::to_string(row_) + " of " + std::to_string(rows_) + " rows");
+    while (entries_ < target_) {
+      if (cur.empty())
+        return fail("column chunk ended after " + std::to_string(entries_) + " of " + std::to_string(target_) + " values");
       auto ph = nanom::thrift_compact<pq::PageHeader>()(cur);
       if (!ph) return fail("bad page header: " + ph.error().render(whole));
       const pq::PageHeader& h = ph->value;
@@ -224,35 +254,42 @@ class chunk_decoder {
  private:
   // ---- output buffers ----
   status init_output() {
+    if (l_.kind == conv::null) return ok();  // the null type has no buffers
     validity_ = ArrowArrayValidityBitmap(out_);
-    if (ArrowBitmapReserve(validity_, rows_) != NANOARROW_OK) return fail("out of memory");
-    if (rows_ > 0) std::memset(validity_->buffer.data, 0xff, std::size_t((rows_ + 7) / 8));
+    if (ArrowBitmapReserve(validity_, cap_) != NANOARROW_OK) return fail("out of memory");
+    if (cap_ > 0) std::memset(validity_->buffer.data, 0xff, std::size_t((cap_ + 7) / 8));
     data_ = ArrowArrayBuffer(out_, 1);
     if (l_.kind == conv::boolean) {
-      if (ArrowBufferReserve(data_, (rows_ + 7) / 8) != NANOARROW_OK) return fail("out of memory");
-      if (rows_ > 0) std::memset(data_->data, 0, std::size_t((rows_ + 7) / 8));
+      if (ArrowBufferReserve(data_, (cap_ + 7) / 8) != NANOARROW_OK) return fail("out of memory");
+      if (cap_ > 0) std::memset(data_->data, 0, std::size_t((cap_ + 7) / 8));
     } else if (l_.kind == conv::binary) {
-      if (ArrowBufferReserve(data_, (rows_ + 1) * 4) != NANOARROW_OK) return fail("out of memory");
+      if (ArrowBufferReserve(data_, (cap_ + 1) * 4) != NANOARROW_OK) return fail("out of memory");
       std::memset(data_->data, 0, 4);
       bdata_ = ArrowArrayBuffer(out_, 2);
     } else {
-      const std::int64_t bytes = rows_ * std::int64_t(l_.out_width);
+      const std::int64_t bytes = cap_ * std::int64_t(l_.out_width);
       if (ArrowBufferReserve(data_, bytes) != NANOARROW_OK) return fail("out of memory");
     }
     return ok();
   }
 
   status finish() {
+    if (!keep_ && row_ != rows_) return fail("internal: flat column produced " + std::to_string(row_) + " rows");
+    if (l_.kind == conv::null) {
+      out_->length = row_;
+      out_->null_count = row_;
+      return ok();
+    }
     if (null_count_ == 0) {
       ArrowBitmapReset(validity_);
     } else {
-      validity_->size_bits = rows_;
-      validity_->buffer.size_bytes = (rows_ + 7) / 8;
+      validity_->size_bits = row_;
+      validity_->buffer.size_bytes = (row_ + 7) / 8;
     }
-    if (l_.kind == conv::boolean) data_->size_bytes = (rows_ + 7) / 8;
-    else if (l_.kind == conv::binary) data_->size_bytes = (rows_ + 1) * 4;
-    else data_->size_bytes = rows_ * std::int64_t(l_.out_width);
-    out_->length = rows_;
+    if (l_.kind == conv::boolean) data_->size_bytes = (row_ + 7) / 8;
+    else if (l_.kind == conv::binary) data_->size_bytes = (row_ + 1) * 4;
+    else data_->size_bytes = row_ * std::int64_t(l_.out_width);
+    out_->length = row_;
     out_->null_count = null_count_;
     return ok();
   }
@@ -306,7 +343,16 @@ class chunk_decoder {
     bytes_span page;
     auto st = decompress(codec_, body, std::size_t(*h.uncompressed_page_size), page_buf_, page);
     if (!st) return st;
-    bytes_span def;
+    bytes_span rep_lv, def;
+    if (l_.max_rep > 0) {
+      if (*dh.repetition_level_encoding != Encoding::RLE)
+        return fail("repetition levels in " + enc_name(*dh.repetition_level_encoding) + " (only RLE is supported)");
+      if (page.size() < 4) return fail("truncated repetition levels");
+      const std::uint32_t len = le32(page.data());
+      if (len > page.size() - 4) return fail("repetition levels run past the page");
+      rep_lv = page.subspan(4, len);
+      page = page.subspan(4 + len);
+    }
     if (l_.max_def > 0) {
       if (*dh.definition_level_encoding != Encoding::RLE)
         return fail("definition levels in " + enc_name(*dh.definition_level_encoding) + " (only RLE is supported)");
@@ -316,7 +362,7 @@ class chunk_decoder {
       def = page.subspan(4, len);
       page = page.subspan(4 + len);
     }
-    return page_values(std::size_t(*dh.num_values), def, *dh.encoding, page, -1);
+    return page_values(std::size_t(*dh.num_values), rep_lv, def, *dh.encoding, page, -1);
   }
 
   status data_page_v2(const pq::PageHeader& h, bytes_span body) {
@@ -331,15 +377,16 @@ class chunk_decoder {
     const std::size_t vals_size = std::size_t(*h.uncompressed_page_size) - std::size_t(rl) - std::size_t(dl);
     bytes_span vals;
     const bool compressed = dh.is_compressed->value_or(true);
-    if (compressed && *dh.num_nulls == 0 && *dh.encoding == Encoding::PLAIN && l_.max_rep == 0) {
+    if (!keep_ && compressed && *dh.num_nulls == 0 && *dh.encoding == Encoding::PLAIN && l_.max_rep == 0) {
       bool done = false;
       auto st = direct_plain(codec_, vals_in, vals_size, std::size_t(*dh.num_values), done);
       if (!st || done) return st;
     }
     auto st = decompress(compressed ? codec_ : CompressionCodec::UNCOMPRESSED, vals_in, vals_size, page_buf_, vals);
     if (!st) return st;
-    return page_values(std::size_t(*dh.num_values), l_.max_def > 0 ? def : bytes_span{}, *dh.encoding, vals,
-                       *dh.num_nulls);
+    const bytes_span rep_lv = body.subspan(0, std::size_t(rl));
+    return page_values(std::size_t(*dh.num_values), l_.max_rep > 0 ? rep_lv : bytes_span{},
+                       l_.max_def > 0 ? def : bytes_span{}, *dh.encoding, vals, keep_ ? -1 : *dh.num_nulls);
   }
 
   /// PLAIN fixed-width page whose decompressed bytes ARE the output values (no levels inside, no
@@ -347,8 +394,8 @@ class chunk_decoder {
   /// Returns false (doing nothing) when the page does not qualify.
   status direct_plain(CompressionCodec codec, bytes_span body, std::size_t out_size, std::size_t n, bool& done) {
     done = false;
-    if (l_.kind != conv::copy || codec == CompressionCodec::UNCOMPRESSED || l_.out_width == 0) return ok();
-    if (std::int64_t(n) > rows_ - row_ || out_size != n * l_.out_width) return ok();
+    if (keep_ || l_.kind != conv::copy || codec == CompressionCodec::UNCOMPRESSED || l_.out_width == 0) return ok();
+    if (std::int64_t(n) > cap_ - row_ || out_size != n * l_.out_width) return ok();
     std::span<std::byte> target(reinterpret_cast<std::byte*>(data_->data) + std::size_t(row_) * l_.out_width, out_size);
     switch (codec) {
       case CompressionCodec::SNAPPY: {
@@ -370,13 +417,71 @@ class chunk_decoder {
         return ok();  // other codecs take the staged path
     }
     row_ += std::int64_t(n);
+    entries_ += std::int64_t(n);
     done = true;
     return ok();
   }
 
+  /// Nested leaf: decode this page's rep/def levels, append them to keep_, and build the page's
+  /// slot validity (slots = entries with def >= d_enc; valid = def == max_def). Returns the slot
+  /// count in `slots` and the non-null count in `nn`.
+  status nested_levels(std::size_t n, bytes_span rep, bytes_span def, std::size_t& slots, std::size_t& nn) {
+    const std::size_t base = keep_->def.size();
+    level_buf_.resize(n);
+    if (l_.max_rep > 0) {
+      col::rle_bp_decoder d(rep, unsigned(std::bit_width(unsigned(l_.max_rep))));
+      if (d.get(level_buf_.data(), n) != n || !d.ok()) return fail("repetition levels shorter than the page");
+      for (std::size_t i = 0; i < n; ++i)
+        if (level_buf_[i] > std::uint32_t(l_.max_rep)) return fail("repetition level above the column's maximum");
+      if (n && entries_ == 0 && level_buf_[0] != 0) return fail("column chunk does not start at a row boundary");
+      keep_->rep.insert(keep_->rep.end(), level_buf_.begin(), level_buf_.end());
+    } else {
+      keep_->rep.resize(base + n, 0);
+    }
+    if (l_.max_def > 0) {
+      col::rle_bp_decoder d(def, unsigned(std::bit_width(unsigned(l_.max_def))));
+      if (d.get(level_buf_.data(), n) != n || !d.ok()) return fail("definition levels shorter than the page");
+      for (std::size_t i = 0; i < n; ++i)
+        if (level_buf_[i] > std::uint32_t(l_.max_def)) return fail("definition level above the column's maximum");
+      keep_->def.insert(keep_->def.end(), level_buf_.begin(), level_buf_.end());
+    } else {
+      keep_->def.resize(base + n, 0);
+    }
+    const std::uint16_t* dl = keep_->def.data() + base;
+    pv_.assign(((n + 63) / 64) * 8, std::uint8_t(0));
+    slots = 0;
+    nn = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      if (dl[i] < std::uint16_t(d_enc_)) continue;  // an empty or null ancestor: no slot here
+      if (dl[i] == std::uint16_t(l_.max_def)) {
+        pv_[slots / 8] = std::uint8_t(pv_[slots / 8] | (1u << (slots % 8)));
+        ++nn;
+      }
+      ++slots;
+    }
+    return ok();
+  }
+
   /// Common tail of v1/v2 pages: levels -> validity, then values.
-  status page_values(std::size_t n, bytes_span def, Encoding enc, bytes_span vals, std::int64_t declared_nulls) {
-    if (std::int64_t(n) > rows_ - row_) return fail("pages hold more values than the row group has rows");
+  status page_values(std::size_t n, bytes_span rep, bytes_span def, Encoding enc, bytes_span vals,
+                     std::int64_t declared_nulls) {
+    if (std::int64_t(n) > target_ - entries_) return fail("pages hold more values than the column chunk declares");
+    entries_ += std::int64_t(n);
+    if (keep_) {
+      std::size_t slots = 0, nn = 0;
+      auto st = nested_levels(n, rep, def, slots, nn);
+      if (!st) return st;
+      if (std::int64_t(slots) > cap_ - row_) return fail("internal: nested slots exceed capacity");
+      has_nulls_in_page_ = nn != slots;
+      if (l_.kind != conv::null && has_nulls_in_page_ &&
+          !col::copy_bits(std::as_bytes(std::span(pv_)), slots,
+                          std::span<std::byte>(reinterpret_cast<std::byte*>(validity_->buffer.data),
+                                               std::size_t((cap_ + 7) / 8)),
+                          std::size_t(row_)))
+        return fail("internal: validity bitmap too small");
+      return values(enc, vals, slots, nn);
+    }
+    if (std::int64_t(n) > cap_ - row_) return fail("pages hold more values than the row group has rows");
     std::size_t nn = n;
     has_nulls_in_page_ = false;
     if (l_.max_def > 0) {
@@ -423,15 +528,25 @@ class chunk_decoder {
         }
       }
       has_nulls_in_page_ = nn != n;
-      if (has_nulls_in_page_ &&
+      if (l_.kind != conv::null && has_nulls_in_page_ &&
           !col::copy_bits(std::as_bytes(std::span(pv_)), n,
                           std::span<std::byte>(reinterpret_cast<std::byte*>(validity_->buffer.data),
-                                               std::size_t((rows_ + 7) / 8)),
+                                               std::size_t((cap_ + 7) / 8)),
                           std::size_t(row_)))
         return fail("internal: validity bitmap too small");
     }
     if (declared_nulls >= 0 && std::size_t(declared_nulls) != n - nn) return fail("data page v2 num_nulls disagrees with its levels");
+    return values(enc, vals, n, nn);
+  }
+
+  /// Decode nn non-null values and place them over the page's n slots (validity in pv_).
+  status values(Encoding enc, bytes_span vals, std::size_t n, std::size_t nn) {
     null_count_ += std::int64_t(n - nn);
+    if (l_.kind == conv::null) {
+      if (nn) return fail("non-null value in a column annotated UNKNOWN (the null type)");
+      row_ += std::int64_t(n);
+      return ok();
+    }
     status st = ok();
     switch (l_.kind) {
       case conv::boolean: st = booleans(enc, vals, n, nn); break;
@@ -658,7 +773,7 @@ class chunk_decoder {
   // ---- booleans ----
   status booleans(Encoding enc, bytes_span vals, std::size_t n, std::size_t nn) {
     auto* bits = reinterpret_cast<std::byte*>(data_->data);
-    const std::span<std::byte> out(bits, std::size_t((rows_ + 7) / 8));
+    const std::span<std::byte> out(bits, std::size_t((cap_ + 7) / 8));
     if (enc == Encoding::PLAIN && nn == n)
       return col::copy_bits(vals, n, out, std::size_t(row_)) ? ok() : fail("PLAIN boolean page shorter than its values");
     dense_bits_.resize(nn);
@@ -824,7 +939,12 @@ class chunk_decoder {
   const read_options& opt_;
   ArrowArray* out_;
   std::int64_t rows_;
-  std::int64_t row_ = 0, null_count_ = 0;
+  std::int16_t d_enc_ = 0;
+  leaf_levels* keep_ = nullptr;
+  std::int64_t cap_ = 0;       ///< value slots the output buffers hold
+  std::int64_t target_ = 0;    ///< level entries (values incl. nulls) the chunk declares
+  std::int64_t entries_ = 0;   ///< level entries consumed so far
+  std::int64_t row_ = 0, null_count_ = 0;  ///< row_: value slots written so far
   CompressionCodec codec_ = CompressionCodec::UNCOMPRESSED;
   ArrowBitmap* validity_ = nullptr;
   ArrowBuffer* data_ = nullptr;
@@ -838,7 +958,7 @@ class chunk_decoder {
 
   std::vector<std::byte> page_buf_, dense_;
   std::vector<std::uint8_t> dense_bits_;
-  std::vector<std::uint32_t> levels_;
+  std::vector<std::uint32_t> levels_, level_buf_;
   std::vector<std::uint8_t> pv_;  ///< page-local validity bits, padded to whole 64-bit words
   std::vector<std::string_view> views_;
   std::vector<std::int32_t> lengths_, prefix_;
@@ -848,8 +968,8 @@ class chunk_decoder {
 }  // namespace
 
 status read_column_chunk(const file& f, const leaf& l, const pq::ColumnChunk& chunk, std::int64_t rows,
-                         const read_options& opt, ArrowArray* out) {
-  chunk_decoder d(f, l, opt, out, rows);
+                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out) {
+  chunk_decoder d(f, l, opt, out, rows, d_enc, keep);
   auto st = d.run(chunk);
   if (!st) return fail("column '" + l.name + "': " + st.error().message);
   return st;

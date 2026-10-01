@@ -11,3 +11,4 @@ compile_commands.json
 *.a
 # Local test artifacts
 *.parquet
+/bench/arrow_rs/target/

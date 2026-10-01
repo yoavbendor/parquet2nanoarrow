@@ -40,7 +40,17 @@ def datasets(n):
                         "u": pa.array([f"user_{i}_{i * 7919 % 100003}" for i in range(n // 4)] * 4)})
     mixed = pa.table({"id": pa.array(np.arange(n)), "x": pa.array(rng.standard_normal(n)),
                       "cat": pa.array(words[rng.integers(0, 50, n)]), "flag": pa.array(rng.random(n) < 0.5)})
+    lens = rng.integers(0, 6, n // 4)
+    flat_vals = rng.integers(-2**40, 2**40, int(lens.sum()))
+    offsets = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    nested = pa.table({
+        "l_i64": pa.ListArray.from_arrays(pa.array(offsets), pa.array(flat_vals),
+                                          mask=pa.array(rng.random(n // 4) < 0.05)),
+        "st": pa.StructArray.from_arrays([pa.array(rng.integers(0, 1000, n // 4)),
+                                          pa.array(words[rng.integers(0, 5000, n // 4)])], names=["a", "b"]),
+    })
     return [
+        ("nested: list<int64> + struct<int64,string>, snappy (n/4 rows)", nested, dict(compression="snappy")),
         ("int64 x4, plain, uncompressed", ints, dict(compression="none", use_dictionary=False)),
         ("int64 x4, snappy", ints, dict(compression="snappy")),
         ("float64 x4, zstd", floats, dict(compression="zstd", use_dictionary=False)),
@@ -85,7 +95,7 @@ def main():
                                                        "glibc.malloc.trim_threshold=4294967295")
             ours = json.loads(subprocess.run([tool, path, str(reps)], capture_output=True, text=True,
                                              check=True, env=warm_env).stdout)
-            assert ours["rows"] == n, ours
+            assert ours["rows"] == table.num_rows, ours
             single = best(lambda: pq.read_table(path, use_threads=False), reps)
             threaded = best(lambda: pq.read_table(path), reps)
             ours_first = min(json.loads(subprocess.run([tool, path, "1"], capture_output=True, text=True,

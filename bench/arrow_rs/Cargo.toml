@@ -1,0 +1,18 @@
+[package]
+name = "arrow_rs_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference reader for bench/compare_arrow_rs.py: the Apache Arrow Rust `parquet` crate's Arrow
+# reader, configured like p2n_bench (single-threaded, one batch per row group).
+[dependencies]
+parquet = { version = "*", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "flate2", "flate2-zlib-rs", "brotli"] }
+
+snap = "1"
+lz4_flex = "*"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

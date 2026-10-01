@@ -47,12 +47,12 @@ table = pa.RecordBatchReader._import_from_c(int(ffi.cast("uintptr_t", stream))).
 | encodings | PLAIN, PLAIN_DICTIONARY / RLE_DICTIONARY, RLE (booleans), DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT |
 | codecs | UNCOMPRESSED, SNAPPY, GZIP, ZSTD, LZ4_RAW, LZ4 (Hadoop framing and bare blocks) |
 | pages | data page v1 and v2, dictionary pages, multi-page chunks, any number of row groups |
-| columns | flat top-level columns (required or optional), with projection by name |
+| columns | flat and **nested** columns, with projection by top-level name: struct, list, map and any nesting of them, with nulls at every level; legacy list layouts (2-level lists, `array` / `_tuple` elements, unannotated `repeated` fields), key-only maps (read as lists, as Arrow does), the `UNKNOWN` logical type (Arrow null type) |
+| extension types | JSON → `arrow.json`, UUID → `arrow.uuid` (canonical Arrow extension types, as pyarrow returns them) |
 
 **Not yet:**
-- nested columns (struct / list / map), which are skipped with `skip_unsupported` or reported as an
-  error naming the column;
-- `large_string` for more than 2 GiB of strings in one row group;
+- `large_string` / `large_list` for more than 2 GiB of strings or 2^31 list elements in one row group;
+- `decimal256` (precision above 38) and the BROTLI codec;
 - encrypted files;
 - reading the embedded `ARROW:schema`, so a timestamp's original non-UTC timezone and other
   Arrow-only type details are not restored;
@@ -75,7 +75,8 @@ The file is untrusted input.
 
 | check | what it proves |
 |---|---|
-| `tests/differential.py` | 60 pyarrow-written files covering every type, encoding, codec, page version and null density above. Each is read through the C ABI and imported into pyarrow via the C Data Interface. Every table must equal `pyarrow.parquet.read_table` exactly: schema, nullability, values and null positions (floats by bit pattern). It also checks projection, unsupported-column errors and empty files. |
+| `tests/differential.py` | 81 pyarrow-written files covering every type, encoding, codec, page version and null density above, plus 21 files of nested columns (lists of structs, structs of lists, maps of lists, lists of lists, three-deep structs; nulls and empty lists at every level). Each is read through the C ABI and imported into pyarrow via the C Data Interface. Every table must equal `pyarrow.parquet.read_table` exactly: schema, nullability, values and null positions (floats by bit pattern). It also checks projection, unsupported-column errors and empty files. |
+| `tests/parquet_testing.py` | every file of [apache/parquet-testing](https://github.com/apache/parquet-testing) (pinned): files from parquet-mr, Spark, Impala, Arrow and others, incl. legacy list/map layouts and writer bugs (PARQUET-816 chunk sizes, concatenated gzip members, reused Thrift field ids). Result: **76 files equal pyarrow's output exactly, 5 are rejected by both libraries, 0 mismatches**. |
 | `fuzz/fuzz_reader.cpp` + `tests/make_fuzz_seeds.py` | the whole reader on mutated files (footer-biased bit flips, overwrites, truncation, splices) under ASan/UBSan. 200,000 mutated files ran with no crash; about 50,000 row groups still decoded and the rest were rejected with errors. |
 | nanom's own suites | the Thrift model against pyarrow footers, and the kernels and codecs against reference implementations, pyarrow's compressors and fuzzing |
 
@@ -86,13 +87,17 @@ shared 4-core cloud container (indicative, not a lab measurement). pyarrow is 25
 
 | file | MB | p2n warm ms | pyarrow warm ms | speedup | p2n first read ms | pyarrow first read ms | speedup |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| int64 x4, plain, uncompressed | 160 | 55.2 | 75.8 | 1.37x | 139.7 | 159.6 | 1.14x |
-| int64 x4, snappy | 160 | 192.8 | 192.2 | 1.00x | 295.0 | 322.8 | 1.09x |
-| float64 x4, zstd | 153 | 217.4 | 182.8 | 0.84x | 319.8 | 334.6 | 1.05x |
-| nullable int + double, snappy | 36 | 78.5 | 70.7 | 0.90x | 139.5 | 158.3 | 1.14x |
-| strings, dictionary, snappy | 58 | 249.3 | 320.9 | 1.29x | 418.2 | 545.4 | 1.30x |
-| strings, plain, zstd | 33 | 337.0 | 284.4 | 0.84x | 448.1 | 394.7 | 0.88x |
-| mixed, lz4_raw, page v2 | 67 | 181.1 | 211.1 | 1.17x | 286.1 | 366.0 | 1.28x |
+| nested: list<int64> + struct<int64,string>, snappy (1.25M rows) | 28 | 107.9 | 121.2 | 1.12x | 170.3 | 342.8 | 2.01x |
+| int64 x4, plain, uncompressed | 160 | 55.5 | 65.7 | 1.18x | 148.4 | 165.9 | 1.12x |
+| int64 x4, snappy | 160 | 215.8 | 207.9 | 0.96x | 302.1 | 311.6 | 1.03x |
+| float64 x4, zstd | 153 | 214.1 | 199.4 | 0.93x | 313.2 | 322.0 | 1.03x |
+| nullable int + double, snappy | 36 | 71.5 | 70.5 | 0.99x | 132.0 | 157.7 | 1.19x |
+| strings, dictionary, snappy | 58 | 297.9 | 402.4 | 1.35x | 387.2 | 507.9 | 1.31x |
+| strings, plain, zstd | 33 | 323.1 | 261.7 | 0.81x | 457.5 | 443.6 | 0.97x |
+| mixed, lz4_raw, page v2 | 67 | 182.5 | 214.7 | 1.18x | 275.6 | 349.2 | 1.27x |
+
+Ratios move by up to about 10% between runs in this environment, so treat a ratio within ±0.1 of 1.0
+as a tie.
 
 How to read the columns:
 

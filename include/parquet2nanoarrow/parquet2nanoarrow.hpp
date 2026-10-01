@@ -45,8 +45,8 @@ using status = result<ok_t>;
 struct read_options {
   /// Top-level columns to read, in output order; empty = every column.
   std::vector<std::string> columns;
-  /// Skip columns this version cannot decode yet (nested groups, repeated fields) instead of
-  /// failing when they are part of the default (all-columns) projection.
+  /// Skip columns this version cannot decode (malformed LIST/MAP groups, unsupported types)
+  /// instead of failing when they are part of the default (all-columns) projection.
   bool skip_unsupported = false;
   /// Upper bound on one page's uncompressed size (decompression-bomb guard).
   std::size_t max_page_bytes = std::size_t(1) << 30;
@@ -63,12 +63,14 @@ struct read_options {
 /// One top-level output column, as resolved at open().
 struct column_info {
   std::string name;
-  int         leaf_index = -1;   ///< position among the file's leaf columns (column chunk index)
+  int         leaf_index = -1;   ///< first leaf column (column chunk index) under this column
   std::string arrow_format;      ///< Arrow C Data Interface format string
   bool        nullable = true;
 };
 
 class file;  // internal: the mapped file + decoded footer
+struct anode;
+struct leaf_levels;
 
 class reader {
  public:
@@ -93,8 +95,12 @@ class reader {
 
  private:
   static result<reader> make(std::shared_ptr<const file> f, read_options options);
+  const anode* column_node(std::size_t i) const;
+  status decode_leaves(const anode& n, const std::vector<nanom_formats::parquet::ColumnChunk>& chunks,
+                       std::int64_t rows, std::vector<leaf_levels>& levels, ArrowArray* arr) const;
   std::shared_ptr<const file> file_;
   std::vector<column_info> columns_;
+  std::vector<std::size_t> top_index_;  ///< per output column: its top-level schema node
   read_options options_;
 };
 

@@ -21,6 +21,11 @@ def table(n=300):
         "f": pa.array([i / 3 for i in range(n)], pa.float64()),
         "b": pa.array([i % 2 == 0 for i in range(n)], pa.bool_()),
         "d": pa.array([i * 10 for i in range(n)], pa.decimal128(9, 2)),
+        "l": pa.array([[j for j in range(i % 4)] if i % 6 else None for i in range(n)], pa.list_(pa.int32())),
+        "st": pa.array([{"a": i, "b": [f"x{i % 3}"] * (i % 3)} if i % 5 else None for i in range(n)],
+                       pa.struct([("a", pa.int64()), ("b", pa.list_(pa.string()))])),
+        "m": pa.array([[(f"k{j}", j) for j in range(i % 3)] if i % 7 else None for i in range(n)],
+                      pa.map_(pa.string(), pa.int64())),
     })
 
 

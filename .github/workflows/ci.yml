@@ -50,6 +50,13 @@ jobs:
         run: |
           export LD_PRELOAD="$(g++-13 -print-file-name=libasan.so):$(g++-13 -print-file-name=libubsan.so)"
           python3 tests/differential.py build/libparquet2nanoarrow_c.so
+      - name: parquet-testing corpus (sanitized)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          export LD_PRELOAD="$(g++-13 -print-file-name=libasan.so):$(g++-13 -print-file-name=libubsan.so)"
+          python3 tests/parquet_testing.py build/libparquet2nanoarrow_c.so .deps/parquet_testing-src
       - name: corrupted-file fuzzing (sanitized)
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1

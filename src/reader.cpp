@@ -28,12 +28,16 @@ result<std::shared_ptr<file>> file::load(std::shared_ptr<mapped_file> mapping, s
 namespace {
 
 /// Resolve the projection (or the default all-columns set) into output columns.
-result<std::vector<column_info>> resolve_columns(const file& f, const read_options& options) {
+/// Also records, per output column, the index of its top-level node in file::top.
+result<std::vector<column_info>> resolve_columns(const file& f, const read_options& options,
+                                                 std::vector<std::size_t>& top_index) {
   std::vector<column_info> cols;
-  const auto add = [&](const top_column& t) -> status {
-    if (!t.unsupported.empty()) return fail("column '" + t.name + "': " + t.unsupported);
-    const leaf& l = f.leaves[std::size_t(t.leaf)];
-    cols.push_back(column_info{t.name, l.index, l.format, t.nullable});
+  const auto add = [&](const anode& t) -> status {
+    top_index.push_back(std::size_t(&t - f.top.data()));
+    if (!t.unsupported.empty()) return fail("column '" + t.name + "' is not supported: " + t.unsupported);
+    std::string fmt = t.k == anode::kind::primitive ? f.leaves[std::size_t(t.leaf)].format
+                    : t.k == anode::kind::structure ? "+s" : t.k == anode::kind::list ? "+l" : "+m";
+    cols.push_back(column_info{t.name, t.first_leaf, std::move(fmt), t.nullable});
     return ok();
   };
   if (options.columns.empty()) {
@@ -44,7 +48,7 @@ result<std::vector<column_info>> resolve_columns(const file& f, const read_optio
     }
     return cols;
   }
-  std::unordered_map<std::string, const top_column*> by_name;
+  std::unordered_map<std::string, const anode*> by_name;
   for (const auto& t : f.top) by_name.emplace(t.name, &t);
   for (const auto& name : options.columns) {
     const auto it = by_name.find(name);
@@ -58,9 +62,9 @@ result<std::vector<column_info>> resolve_columns(const file& f, const read_optio
 }  // namespace
 
 result<reader> reader::make(std::shared_ptr<const file> f, read_options options) {
-  auto cols = resolve_columns(*f, options);
-  if (!cols) return nanom::unexpected<error>(cols.error());
   reader r;
+  auto cols = resolve_columns(*f, options, r.top_index_);
+  if (!cols) return nanom::unexpected<error>(cols.error());
   r.file_ = std::move(f);
   r.columns_ = std::move(*cols);
   r.options_ = std::move(options);
@@ -96,12 +100,27 @@ status reader::schema(ArrowSchema* out) const {
   }
   out->flags = 0;
   for (std::size_t i = 0; i < columns_.size(); ++i) {
-    const auto& c = columns_[i];
-    auto st = leaf_arrow_schema(file_->leaves[std::size_t(c.leaf_index)], c.name, c.nullable, out->children[i]);
+    auto st = node_arrow_schema(*file_, *column_node(i), out->children[i]);
     if (!st) {
       out->release(out);
       return st;
     }
+  }
+  return ok();
+}
+
+const anode* reader::column_node(std::size_t i) const { return &file_->top[top_index_[i]]; }
+
+status reader::decode_leaves(const anode& n, const std::vector<pq::ColumnChunk>& chunks, std::int64_t rows,
+                             std::vector<leaf_levels>& levels, ArrowArray* arr) const {
+  if (n.k == anode::kind::primitive) {
+    const leaf& l = file_->leaves[std::size_t(n.leaf)];
+    return read_column_chunk(*file_, l, chunks[std::size_t(l.index)], rows, n.d_enc, &levels[std::size_t(l.index)],
+                             options_, arr);
+  }
+  for (std::size_t c = 0; c < n.children.size(); ++c) {
+    auto st = decode_leaves(n.children[c], chunks, rows, levels, arr->children[c]);
+    if (!st) return st;
   }
   return ok();
 }
@@ -115,7 +134,9 @@ status reader::read_row_group(std::size_t index, ArrowArray* out) const {
     return fail("row group " + std::to_string(index) + " declares " + std::to_string(rows) +
                 " rows, over read_options::max_row_group_rows");
   auto chunks = rg.columns->to_vector();
-  if (!chunks) return fail("bad column chunk metadata in row group " + std::to_string(index));
+  if (!chunks)
+    return fail("bad column chunk metadata in row group " + std::to_string(index) + ": " +
+                chunks.error().render(file_->input()));
   if (chunks->size() != file_->leaves.size())
     return fail("row group " + std::to_string(index) + " has " + std::to_string(chunks->size()) +
                 " column chunks for " + std::to_string(file_->leaves.size()) + " schema leaves");
@@ -129,9 +150,18 @@ status reader::read_row_group(std::size_t index, ArrowArray* out) const {
     return fail(std::string("cannot allocate the output array: ") + aerr.message);
   }
   sch.release(&sch);
+  std::vector<leaf_levels> levels;
   for (std::size_t i = 0; i < columns_.size(); ++i) {
-    const leaf& l = file_->leaves[std::size_t(columns_[i].leaf_index)];
-    st = read_column_chunk(*file_, l, (*chunks)[std::size_t(l.index)], rows, options_, out->children[i]);
+    const anode& n = *column_node(i);
+    if (n.flat()) {
+      const leaf& l = file_->leaves[std::size_t(n.leaf)];
+      st = read_column_chunk(*file_, l, (*chunks)[std::size_t(l.index)], rows, 0, nullptr, options_, out->children[i]);
+    } else {
+      // nested: decode every leaf below (keeping its levels), then assemble the structure
+      levels.assign(file_->leaves.size(), {});
+      st = decode_leaves(n, *chunks, rows, levels, out->children[i]);
+      if (st) st = assemble_nested(*file_, n, levels, rows, out->children[i]);
+    }
     if (!st) {
       out->release(out);
       return fail("row group " + std::to_string(index) + ": " + st.error().message);

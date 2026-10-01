@@ -33,6 +33,30 @@ void map_type(const pq::SchemaElement& e, leaf& l) {
     l.format = "d:" + std::to_string(precision) + "," + std::to_string(scale);
     l.out_width = 16;
   };
+  // A logical annotation that does not fit its physical type is rejected (as Arrow does), not
+  // silently ignored: reading such a column as its bare physical type would misrepresent it.
+  if (lt) {
+    const auto& L = *lt;
+    const Type t = l.physical;
+    const auto bad = [&](const char* what) {
+      l.unsupported = std::string(what) + " annotation on physical type " + std::to_string(int(t)) + " is invalid";
+    };
+    if ((L.STRING->has_value() || L.ENUM->has_value() || L.JSON->has_value() || L.BSON->has_value()) &&
+        t != Type::BYTE_ARRAY) return bad("STRING/ENUM/JSON/BSON");
+    if (L.UUID->has_value() && !(t == Type::FIXED_LEN_BYTE_ARRAY && l.type_length == 16)) return bad("UUID");
+    if (L.DATE->has_value() && t != Type::INT32) return bad("DATE");
+    if (L.TIMESTAMP->has_value() && t != Type::INT64) return bad("TIMESTAMP");
+    if (L.TIME->has_value() && t != Type::INT32 && t != Type::INT64) return bad("TIME");
+    if (L.INTEGER->has_value() && t != Type::INT32 && t != Type::INT64) return bad("INTEGER");
+    if (L.FLOAT16->has_value() && !(t == Type::FIXED_LEN_BYTE_ARRAY && l.type_length == 2)) return bad("FLOAT16");
+    if (L.DECIMAL->has_value() && t != Type::INT32 && t != Type::INT64 && t != Type::FIXED_LEN_BYTE_ARRAY &&
+        t != Type::BYTE_ARRAY) return bad("DECIMAL");
+    if (L.UNKNOWN->has_value()) {  // the null type: every value is null
+      l.kind = conv::null;
+      l.format = "n";
+      return;
+    }
+  }
   const bool is_decimal = (lt && (*lt).DECIMAL->has_value()) || ct == ConvertedType::DECIMAL;
   std::int32_t precision = 0, scale = 0;
   if (lt && (*lt).DECIMAL->has_value()) {
@@ -128,6 +152,7 @@ void map_type(const pq::SchemaElement& e, leaf& l) {
       const bool text = (lt && ((*lt).STRING->has_value() || (*lt).JSON->has_value() || (*lt).ENUM->has_value())) ||
                         ct == ConvertedType::UTF8 || ct == ConvertedType::JSON || ct == ConvertedType::ENUM;
       l.format = text ? "u" : "z";
+      if ((lt && (*lt).JSON->has_value()) || ct == ConvertedType::JSON) l.extension = "arrow.json";
       return;
     }
     case Type::FIXED_LEN_BYTE_ARRAY: {
@@ -150,86 +175,263 @@ void map_type(const pq::SchemaElement& e, leaf& l) {
         return;
       }
       l.format = "w:" + std::to_string(l.type_length);
+      if (lt && (*lt).UUID->has_value()) l.extension = "arrow.uuid";
       return;
     }
   }
   l.unsupported = "unknown physical type " + std::to_string(int(l.physical));
 }
 
-struct walker {
+/// Link the flattened pre-order element list into file::nodes, with cumulative def/rep depths, and
+/// map every primitive to a leaf.
+struct tree_builder {
   file& f;
   const std::vector<pq::SchemaElement>& s;
-  std::size_t pos = 1;  // element 0 is the root
+  std::size_t pos = 0;
 
-  /// Walk one subtree rooted at s[pos]. `top` is the index into f.top it belongs to.
-  status walk(std::size_t top, std::int16_t def, std::int16_t rep, int depth, bool under_group) {
+  result<int> node(std::int16_t parent_def, std::int16_t parent_rep, int depth) {
     if (depth > 64) return fail("schema nested deeper than 64 levels");
     if (pos >= s.size()) return fail("schema: num_children runs past the element list");
     const pq::SchemaElement& e = s[pos++];
-    const auto r = e.repetition_type->value_or(FieldRepetitionType::OPTIONAL);
-    if (r == FieldRepetitionType::OPTIONAL) ++def;
-    if (r == FieldRepetitionType::REPEATED) { ++def; ++rep; }
+    pnode n;
+    n.name = std::string(*e.name);
+    n.repetition = depth == 0 ? FieldRepetitionType::REQUIRED
+                              : e.repetition_type->value_or(FieldRepetitionType::OPTIONAL);
+    n.def = std::int16_t(parent_def + (n.repetition != FieldRepetitionType::REQUIRED));
+    n.rep = std::int16_t(parent_rep + (n.repetition == FieldRepetitionType::REPEATED));
+    const auto& lt = *e.logicalType;
+    const std::optional<ConvertedType> ct = *e.converted_type;
+    n.is_list = (lt && (*lt).LIST->has_value()) || ct == ConvertedType::LIST;
+    n.is_map = (lt && (*lt).MAP->has_value()) || ct == ConvertedType::MAP;
+    n.is_map_kv = ct == ConvertedType::MAP_KEY_VALUE;
     const std::int32_t children = e.num_children->value_or(0);
-    if (children < 0) return fail("schema: negative num_children");
-    if (e.num_children->has_value() && !e.type->has_value()) {  // group
-      if (std::size_t(children) > s.size() - pos) return fail("schema: num_children runs past the element list");
-      if (f.top[top].unsupported.empty())
-        f.top[top].unsupported = "nested group column (struct/list/map) — not supported yet";
+    if (children < 0 || std::size_t(children) > s.size() - pos) return fail("schema: num_children out of range");
+    n.group = depth == 0 || (e.num_children->has_value() && !e.type->has_value());
+    const int idx = int(f.nodes.size());
+    f.nodes.push_back(std::move(n));
+    if (f.nodes[std::size_t(idx)].group) {
+      std::vector<int> kids;
       for (std::int32_t c = 0; c < children; ++c) {
-        auto st = walk(top, def, rep, depth + 1, true);
-        if (!st) return st;
+        auto k = node(f.nodes[std::size_t(idx)].def, f.nodes[std::size_t(idx)].rep, depth + 1);
+        if (!k) return k;
+        kids.push_back(*k);
       }
-      return ok();
+      f.nodes[std::size_t(idx)].children = std::move(kids);
+      return idx;
     }
-    if (!e.type->has_value()) return fail("schema: leaf element '" + std::string(*e.name) + "' has no physical type");
+    if (!e.type->has_value()) return fail("schema: leaf element '" + f.nodes[std::size_t(idx)].name + "' has no physical type");
     leaf l;
-    l.name = std::string(*e.name);
+    l.name = f.nodes[std::size_t(idx)].name;
     l.index = int(f.leaves.size());
     l.physical = **e.type;
     l.type_length = e.type_length->value_or(0);
-    l.max_def = def;
-    l.max_rep = rep;
-    l.top_level = !under_group && r != FieldRepetitionType::REPEATED;
+    l.max_def = f.nodes[std::size_t(idx)].def;
+    l.max_rep = f.nodes[std::size_t(idx)].rep;
     map_type(e, l);
-    if (!under_group) {
-      if (r == FieldRepetitionType::REPEATED)
-        f.top[top].unsupported = "repeated primitive column — not supported yet";
-      else if (!l.unsupported.empty())
-        f.top[top].unsupported = l.unsupported;
-      f.top[top].leaf = l.index;
-      f.top[top].nullable = r != FieldRepetitionType::REQUIRED;
-    }
+    f.nodes[std::size_t(idx)].leaf = l.index;
     f.leaves.push_back(std::move(l));
-    return ok();
+    return idx;
   }
 };
+
+/// Parquet node -> Arrow node, following the Parquet spec's LIST / MAP compatibility rules.
+struct arrow_builder {
+  const file& f;
+
+  const pnode& at(int i) const { return f.nodes[std::size_t(i)]; }
+
+  /// A node in an ordinary position (struct field or top-level column).
+  anode convert(int i, std::int16_t d_enc) const {
+    const pnode& p = at(i);
+    if (p.repetition == FieldRepetitionType::REPEATED) {
+      // unannotated repeated field: a non-null list of non-null elements
+      anode l;
+      l.k = anode::kind::list;
+      l.name = p.name;
+      l.nullable = false;
+      l.def_present = std::int16_t(p.def - 1);
+      l.def_elem = p.def;
+      l.rep_elem = p.rep;
+      l.children.push_back(element(i, p.def));
+      return l;
+    }
+    if (p.group && p.is_list) return list_of(i);
+    if (p.group && (p.is_map || (p.children.size() == 1 && at(p.children[0]).is_map_kv))) return map_of(i);
+    if (p.group) {
+      anode st;
+      st.k = anode::kind::structure;
+      st.name = p.name;
+      st.nullable = p.repetition == FieldRepetitionType::OPTIONAL;
+      st.def_present = p.def;
+      if (p.children.empty()) st.unsupported = "empty group '" + p.name + "'";
+      for (int c : p.children) st.children.push_back(convert(c, d_enc));
+      return st;
+    }
+    return primitive(i, p.repetition == FieldRepetitionType::OPTIONAL, d_enc);
+  }
+
+  anode primitive(int i, bool nullable, std::int16_t d_enc) const {
+    const pnode& p = at(i);
+    anode a;
+    a.k = anode::kind::primitive;
+    a.name = p.name;
+    a.nullable = nullable;
+    a.leaf = p.leaf;
+    a.def_present = p.def;
+    a.d_enc = d_enc;
+    a.unsupported = f.leaves[std::size_t(p.leaf)].unsupported;
+    return a;
+  }
+
+  /// The repeated node `i` itself used as a list element (non-null: it exists whenever its slot does).
+  anode element(int i, std::int16_t d_enc) const {
+    const pnode& p = at(i);
+    if (!p.group) return primitive(i, false, d_enc);
+    if (p.is_list || p.is_map) {  // a LIST / MAP-annotated repeated group is itself a (non-null) list or map
+      anode l = p.is_list ? list_of(i) : map_of(i);
+      l.nullable = false;
+      return l;
+    }
+    anode st;
+    st.k = anode::kind::structure;
+    st.name = p.name;
+    st.nullable = false;
+    st.def_present = p.def;
+    for (int c : p.children) st.children.push_back(convert(c, d_enc));
+    if (p.children.empty()) st.unsupported = "empty group '" + p.name + "'";
+    return st;
+  }
+
+  anode list_of(int o) const {
+    const pnode& outer = at(o);
+    anode l;
+    l.k = anode::kind::list;
+    l.name = outer.name;
+    l.nullable = outer.repetition == FieldRepetitionType::OPTIONAL;
+    if (outer.children.size() != 1 || at(outer.children[0]).repetition != FieldRepetitionType::REPEATED) {
+      l.unsupported = "LIST group '" + outer.name + "' without exactly one repeated child";
+      return l;
+    }
+    const int r = outer.children[0];
+    const pnode& rep = at(r);
+    l.def_present = outer.def;
+    l.def_elem = rep.def;
+    l.rep_elem = rep.rep;
+    const bool two_level = !rep.group || rep.children.size() > 1 || rep.name == "array" ||
+                           rep.name == outer.name + "_tuple";
+    if (two_level) l.children.push_back(element(r, rep.def));
+    else l.children.push_back(convert(rep.children[0], rep.def));
+    return l;
+  }
+
+  anode map_of(int m) const {
+    const pnode& outer = at(m);
+    anode mp;
+    mp.k = anode::kind::map;
+    mp.name = outer.name;
+    mp.nullable = outer.repetition == FieldRepetitionType::OPTIONAL;
+    if (outer.children.size() != 1) {
+      mp.unsupported = "MAP group '" + outer.name + "' without exactly one child";
+      return mp;
+    }
+    const int kvi = outer.children[0];
+    const pnode& kv = at(kvi);
+    if (kv.repetition == FieldRepetitionType::REPEATED && kv.group && kv.children.size() == 1) {
+      // a key-only MAP (a set): read as a list of the keys, as Arrow does
+      anode l;
+      l.k = anode::kind::list;
+      l.name = outer.name;
+      l.nullable = mp.nullable;
+      l.def_present = outer.def;
+      l.def_elem = kv.def;
+      l.rep_elem = kv.rep;
+      l.children.push_back(convert(kv.children[0], kv.def));
+      return l;
+    }
+    if (kv.repetition != FieldRepetitionType::REPEATED || !kv.group || kv.children.size() != 2) {
+      mp.unsupported = "MAP group '" + outer.name + "' whose key_value is not a repeated group of key and value";
+      return mp;
+    }
+    if (at(kv.children[0]).repetition != FieldRepetitionType::REQUIRED) {
+      mp.unsupported = "MAP group '" + outer.name + "' with a nullable key";
+      return mp;
+    }
+    mp.def_present = outer.def;
+    mp.def_elem = kv.def;
+    mp.rep_elem = kv.rep;
+    anode entries;
+    entries.k = anode::kind::structure;
+    entries.name = kv.name;
+    entries.nullable = false;
+    entries.def_present = kv.def;
+    entries.children.push_back(convert(kv.children[0], kv.def));
+    entries.children.push_back(convert(kv.children[1], kv.def));
+    mp.children.push_back(std::move(entries));
+    return mp;
+  }
+};
+
+/// Bubble the first unsupported reason up and fill first_leaf.
+void finalize(anode& n) {
+  if (n.k == anode::kind::primitive) {
+    n.first_leaf = n.leaf;
+    return;
+  }
+  for (auto& c : n.children) {
+    finalize(c);
+    if (n.first_leaf < 0) n.first_leaf = c.first_leaf;
+    if (n.unsupported.empty() && !c.unsupported.empty()) n.unsupported = c.unsupported;
+  }
+  if (n.first_leaf < 0 && n.unsupported.empty()) n.unsupported = "group '" + n.name + "' without leaves";
+}
 
 }  // namespace
 
 status build_schema(file& f) {
   auto elems = f.meta.schema->to_vector();
   if (!elems) return fail("schema: " + std::string(elems.error().expected));
-  const auto& s = *elems;
-  if (s.empty()) return fail("schema: no root element");
-  const std::int32_t n = s[0].num_children->value_or(0);
-  if (n < 0 || std::size_t(n) > s.size() - 1) return fail("schema: root num_children out of range");
-  walker w{f, s};
-  for (std::int32_t c = 0; c < n; ++c) {
-    if (w.pos >= s.size()) return fail("schema: root num_children runs past the element list");
-    f.top.push_back(top_column{std::string(*s[w.pos].name), -1, {}, true});
-    auto st = w.walk(f.top.size() - 1, 0, 0, 1, false);
-    if (!st) return st;
+  if (elems->empty()) return fail("schema: no root element");
+  tree_builder tb{f, *elems};
+  auto root = tb.node(0, 0, 0);
+  if (!root) return nanom::unexpected<error>(root.error());
+  if (tb.pos != elems->size()) return fail("schema: elements left over after the root's children");
+  arrow_builder ab{f};
+  for (int c : f.nodes[0].children) {
+    anode a = ab.convert(c, 0);
+    finalize(a);
+    f.top.push_back(std::move(a));
   }
-  if (w.pos != s.size()) return fail("schema: elements left over after the root's children");
   return ok();
 }
 
-status leaf_arrow_schema(const leaf& l, const std::string& name, bool nullable, ArrowSchema* out) {
+status node_arrow_schema(const file& f, const anode& n, ArrowSchema* out) {
   ArrowSchemaInit(out);
-  if (ArrowSchemaSetFormat(out, l.format.c_str()) != NANOARROW_OK ||
-      ArrowSchemaSetName(out, name.c_str()) != NANOARROW_OK)
-    return fail("cannot build the Arrow schema for column '" + name + "'");
-  out->flags = nullable ? ARROW_FLAG_NULLABLE : 0;
+  const char* fmt = nullptr;
+  switch (n.k) {
+    case anode::kind::primitive: fmt = f.leaves[std::size_t(n.leaf)].format.c_str(); break;
+    case anode::kind::structure: fmt = "+s"; break;
+    case anode::kind::list:      fmt = "+l"; break;
+    case anode::kind::map:       fmt = "+m"; break;
+  }
+  if (ArrowSchemaSetFormat(out, fmt) != NANOARROW_OK || ArrowSchemaSetName(out, n.name.c_str()) != NANOARROW_OK ||
+      ArrowSchemaAllocateChildren(out, std::int64_t(n.children.size())) != NANOARROW_OK)
+    return fail("cannot build the Arrow schema for column '" + n.name + "'");
+  out->flags = n.nullable ? ARROW_FLAG_NULLABLE : 0;
+  if (n.k == anode::kind::primitive && !f.leaves[std::size_t(n.leaf)].extension.empty()) {
+    // canonical Arrow extension type: storage type + ARROW:extension:name / :metadata
+    ArrowBuffer md;
+    const bool okmd = ArrowMetadataBuilderInit(&md, nullptr) == NANOARROW_OK &&
+                      ArrowMetadataBuilderAppend(&md, ArrowCharView("ARROW:extension:name"),
+                                                 ArrowCharView(f.leaves[std::size_t(n.leaf)].extension.c_str())) == NANOARROW_OK &&
+                      ArrowMetadataBuilderAppend(&md, ArrowCharView("ARROW:extension:metadata"), ArrowCharView("")) == NANOARROW_OK &&
+                      ArrowSchemaSetMetadata(out, reinterpret_cast<const char*>(md.data)) == NANOARROW_OK;
+    ArrowBufferReset(&md);
+    if (!okmd) return fail("cannot attach the Arrow extension type to column '" + n.name + "'");
+  }
+  for (std::size_t i = 0; i < n.children.size(); ++i) {
+    auto st = node_arrow_schema(f, n.children[i], out->children[i]);
+    if (!st) return st;
+  }
   return ok();
 }
 

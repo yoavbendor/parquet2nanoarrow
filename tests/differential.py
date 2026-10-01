@@ -104,8 +104,57 @@ def make_table(rng, nulls):
                      pa.decimal128(18, 5)),
         "dec38": arr([decimal.Decimal(rng.randrange(-10**38 + 1, 10**38)).scaleb(-10) for _ in range(n)],
                      pa.decimal128(38, 10)),
-        "nested_list": pa.array([[1, 2]] * n, pa.list_(pa.int32())),  # unsupported in this version: skipped
+        "big_dec": pa.array([decimal.Decimal(i) for i in range(n)], pa.decimal256(50, 0)),  # unsupported: skipped
     })
+
+
+def nested_table(rng, n, nulls):
+    """Nested columns with random nulls at every level, empty lists and deep nesting."""
+    p_null = {"none": 0.0, "sparse": 0.05, "dense": 0.4}[nulls]
+
+    def maybe(v):
+        return None if rng.random() < p_null else v
+
+    def ints(k):
+        return [maybe(rng.randrange(-1000, 1000)) for _ in range(k)]
+
+    def words(k):
+        return [maybe(f"w{rng.randrange(50)}") for _ in range(k)]
+
+    def lst(gen):
+        return [maybe(gen(rng.randrange(0, 5))) for _ in range(n)]
+
+    point = pa.struct([("x", pa.int32()), ("y", pa.float64()), ("tag", pa.string())])
+    return pa.table({
+        "id": pa.array(range(n), pa.int64()),
+        "l_i32": pa.array(lst(ints), pa.list_(pa.int32())),
+        "l_str": pa.array(lst(words), pa.list_(pa.string())),
+        "l_l": pa.array([maybe([maybe(ints(rng.randrange(0, 3))) for _ in range(rng.randrange(0, 3))])
+                         for _ in range(n)], pa.list_(pa.list_(pa.int16()))),
+        "st": pa.array([maybe({"x": maybe(i), "y": maybe(i / 3), "tag": maybe(f"t{i % 7}")}) for i in range(n)], point),
+        "st_l": pa.array([maybe({"a": maybe(ints(rng.randrange(0, 4))), "b": maybe(i % 2 == 0)}) for i in range(n)],
+                         pa.struct([("a", pa.list_(pa.int64())), ("b", pa.bool_())])),
+        "l_st": pa.array([maybe([maybe({"x": maybe(j), "y": maybe(j * 0.5), "tag": maybe("z")})
+                                 for j in range(rng.randrange(0, 4))]) for _ in range(n)], pa.list_(point)),
+        "m": pa.array([maybe([(f"k{j}", maybe(j)) for j in range(rng.randrange(0, 4))]) for _ in range(n)],
+                      pa.map_(pa.string(), pa.int32())),
+        "m_l": pa.array([maybe([(j, maybe(ints(2))) for j in range(rng.randrange(0, 3))]) for _ in range(n)],
+                        pa.map_(pa.int64(), pa.list_(pa.int32()))),
+        "deep": pa.array([maybe({"inner": maybe({"vals": maybe(words(rng.randrange(0, 3)))})}) for _ in range(n)],
+                         pa.struct([("inner", pa.struct([("vals", pa.list_(pa.string()))]))])),
+    })
+
+
+NESTED_CASES = [
+    ("nested_plain", dict(compression="none", use_dictionary=False)),
+    ("nested_dict_snappy", dict(compression="snappy")),
+    ("nested_zstd_v2", dict(compression="zstd", data_page_version="2.0")),
+    ("nested_small_pages", dict(compression="lz4", data_page_size=512, row_group_size=300)),
+    ("nested_delta", dict(compression="gzip", use_dictionary=False,
+                          column_encoding={"l_i32": "DELTA_BINARY_PACKED", "l_str": "DELTA_BYTE_ARRAY"})),
+    ("nested_legacy_item", dict(compression="snappy", use_compliant_nested_type=False)),
+    ("nested_no_arrow_schema", dict(compression="snappy", store_schema=False)),
+]
 
 
 INT_COLS = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "seq"]
@@ -164,7 +213,7 @@ def main():
                     print(f"{name}/{nulls}: pyarrow cannot write {cfg} ({e}); skipped")
                     continue
                 files += 1
-                expected = pq.read_table(path, columns=[c for c in table.column_names if c != "nested_list"])
+                expected = pq.read_table(path, columns=[c for c in table.column_names if c != "big_dec"])
                 try:
                     got = lib.read(path)
                 except Exception as e:  # noqa: BLE001 - report every failure
@@ -186,13 +235,42 @@ def main():
                 if got.num_rows != expected.num_rows:
                     failures.append(f"{name}/{nulls}: {got.num_rows} rows vs {expected.num_rows}")
 
+        # nested columns: lists, structs, maps, their combinations, nulls at every level
+        for name, cfg in NESTED_CASES:
+            for nulls in ("none", "sparse", "dense"):
+                table = nested_table(rng, 1500, nulls)
+                path = os.path.join(d, f"{name}_{nulls}.parquet")
+                try:
+                    pq.write_table(table, path, **cfg)
+                except (pa.ArrowException, ValueError, TypeError) as e:
+                    print(f"{name}/{nulls}: pyarrow cannot write {cfg} ({e}); skipped")
+                    continue
+                files += 1
+                expected = pq.read_table(path)
+                try:
+                    got = lib.read(path, skip_unsupported=False)
+                except Exception as e:  # noqa: BLE001
+                    failures.append(f"{name}/{nulls}: read failed: {e}")
+                    continue
+                if got.schema != expected.schema:
+                    for fg, fe in zip(got.schema, expected.schema):
+                        if fg != fe:
+                            failures.append(f"{name}/{nulls}: field {fe.name}: got {fg} expected {fe}")
+                    continue
+                for col in expected.column_names:
+                    if not same_column(got[col], expected[col]):
+                        a, b = got[col].combine_chunks(), expected[col].combine_chunks()
+                        first = next((i for i in range(len(b)) if not a[i].equals(b[i])), None)
+                        failures.append(f"{name}/{nulls}: column {col} differs at row {first}: "
+                                        f"{a[first] if first is not None else ''} vs {b[first] if first is not None else ''}")
+
         # required (non-nullable) columns: no definition levels at all, so PLAIN pages are
         # decompressed straight into the output buffers
         for name, cfg in [("req_snappy", dict(compression="snappy", use_dictionary=False)),
                           ("req_zstd_v2", dict(compression="zstd", use_dictionary=False, data_page_version="2.0")),
                           ("req_lz4", dict(compression="lz4", use_dictionary=False, data_page_size=4096)),
                           ("req_dict_gzip", dict(compression="gzip"))]:
-            t = make_table(rng, "none").drop_columns(["nested_list"])
+            t = make_table(rng, "none").drop_columns(["big_dec"])
             t = t.cast(pa.schema([f.with_nullable(False) for f in t.schema]))
             path = os.path.join(d, f"{name}.parquet")
             pq.write_table(t, path, **cfg)
@@ -211,8 +289,8 @@ def main():
         got = lib.read(path, columns=["s", "i64", "b"])
         if not got.equals(pq.read_table(path, columns=["s", "i64", "b"])):
             failures.append("projection: reordered subset differs")
-        # the unsupported nested column is an error when requested or when not skipping
-        for kwargs in (dict(columns=["nested_list"]), dict(skip_unsupported=False)):
+        # an unsupported column (decimal256) is an error when requested or when not skipping
+        for kwargs in (dict(columns=["big_dec"]), dict(skip_unsupported=False)):
             try:
                 lib.read(path, **kwargs)
                 failures.append(f"nested column did not fail with {kwargs}")
