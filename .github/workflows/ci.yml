@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Build with -Werror on gcc and clang, then run the pyarrow differential test and the
+  # corrupted-file fuzzer through ctest.
+  build-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++-13, clang++-18]
+        build: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain + test deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zlib1g-dev ${{ startsWith(matrix.cxx, 'clang') && 'clang-18' || 'g++-13' }}
+          python3 -m pip install --break-system-packages pyarrow cffi
+      - name: configure
+        run: cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DP2N_WERROR=ON
+      - name: build
+        run: cmake --build build
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+
+  # The same tests with the library built under ASan/UBSan. The C ABI library is loaded into the
+  # Python interpreter, so the sanitizer runtimes are preloaded.
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zlib1g-dev g++-13
+          python3 -m pip install --break-system-packages pyarrow cffi
+      - name: configure + build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_BUILD_TYPE=Debug -DP2N_SANITIZER=address,undefined
+          cmake --build build
+      - name: differential (sanitized)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          export LD_PRELOAD="$(g++-13 -print-file-name=libasan.so):$(g++-13 -print-file-name=libubsan.so)"
+          python3 tests/differential.py build/libparquet2nanoarrow_c.so
+      - name: corrupted-file fuzzing (sanitized)
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: python3 tests/make_fuzz_seeds.py build/p2n_fuzz 50000
