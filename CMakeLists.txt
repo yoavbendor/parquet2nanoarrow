@@ -33,7 +33,7 @@ endif()
 if(NOT TARGET nanom::nanom)
     FetchContent_Declare(nanom
         GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-        GIT_TAG eebe4cc9e5b1e1731abe1a2b689cdce2ff022aeb
+        GIT_TAG 2bdf16dc7cee2830c3ca5c67618e8e66c3e72cec
     )
     FetchContent_GetProperties(nanom)
     if(NOT nanom_POPULATED)
