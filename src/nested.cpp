@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Yoav Bendor
 //
 // Nested columns: rebuild struct validity and list / map offsets from the repetition and
-// definition levels of the leaves (Dremel record assembly). The leaf arrays are already decoded,
+// definition levels of the leaves (Dremel record assembly; the scans are nanom's struct_slots /
+// list_slots, this file walks the Arrow tree and owns the buffers). The leaf arrays are already decoded,
 // each holding exactly the value slots inside its innermost enclosing list; this pass fills the
 // structural arrays above them, top-down, one linear scan of one leaf's levels per node.
 //
@@ -15,6 +16,8 @@
 // Every child's length is checked against its parent's slot / element count, so a file whose
 // leaves disagree about the structure is rejected instead of producing inconsistent arrays.
 #include "internal.hpp"
+
+#include <nanom/values.hpp>
 
 namespace p2n {
 namespace {
@@ -49,25 +52,18 @@ status build(const file& f, const anode& n, const std::vector<leaf_levels>& leve
   }
 
   std::vector<std::uint8_t> valid(std::size_t((expected + 7) / 8) + 1, 0);
-  std::int64_t slots = 0, nulls = 0;
-  const auto mark = [&](bool v) {
-    if (v) valid[std::size_t(slots / 8)] = std::uint8_t(valid[std::size_t(slots / 8)] | (1u << (slots % 8)));
-    else ++nulls;
-  };
+  const nanom::columnar::dremel_node nd{std::uint16_t(r_enc), std::uint16_t(d_enc), std::uint16_t(n.def_present),
+                                        std::uint16_t(n.def_elem), std::uint16_t(n.rep_elem)};
+  std::int64_t nulls = 0;
 
   if (n.k == anode::kind::structure) {
-    for (std::size_t i = 0; i < entries; ++i) {
-      if (rep[i] > r_enc || def[i] < d_enc) continue;
-      if (slots >= expected) return fail("struct '" + n.name + "' has more slots than its parent");
-      mark(def[i] >= n.def_present);
-      ++slots;
-    }
-    if (slots != expected) return fail("struct '" + n.name + "' has fewer slots than its parent");
-    auto st = set_validity(arr, valid, slots, nulls);
+    if (auto k = nanom::columnar::struct_slots(rep, def, entries, nd, expected, valid.data(), nulls); !k)
+      return fail("struct '" + n.name + "': " + k.error);
+    auto st = set_validity(arr, valid, expected, nulls);
     if (!st) return st;
-    arr->length = slots;
+    arr->length = expected;
     for (std::size_t c = 0; c < n.children.size(); ++c) {
-      st = build(f, n.children[c], levels, arr->children[c], r_enc, d_enc, slots);
+      st = build(f, n.children[c], levels, arr->children[c], r_enc, d_enc, expected);
       if (!st) return st;
     }
     return ok();
@@ -77,33 +73,15 @@ status build(const file& f, const anode& n, const std::vector<leaf_levels>& leve
   ArrowBuffer* ob = ArrowArrayBuffer(arr, 1);
   use_pool(ob);
   if (ArrowBufferReserve(ob, (expected + 1) * 4) != NANOARROW_OK) return fail("out of memory");
-  auto* offs = reinterpret_cast<std::int32_t*>(ob->data);
   std::int64_t elems = 0;
-  bool open = false;  // the current slot holds a non-empty list
-  for (std::size_t i = 0; i < entries; ++i) {
-    if (rep[i] <= r_enc) {
-      open = false;
-      if (def[i] < d_enc) continue;  // an empty / null ancestor: not a slot of this list
-      if (slots >= expected) return fail("list '" + n.name + "' has more slots than its parent");
-      offs[slots] = std::int32_t(elems);
-      mark(def[i] >= n.def_present);
-      ++slots;
-      if (def[i] >= n.def_elem) {
-        open = true;
-        ++elems;
-      }
-    } else if (rep[i] == n.rep_elem) {
-      if (!open) return fail("list '" + n.name + "': element continues a list that has none");
-      ++elems;
-    }
-    if (elems > INT32_MAX) return fail("list '" + n.name + "' has more than 2^31 elements in one row group");
-  }
-  if (slots != expected) return fail("list '" + n.name + "' has fewer slots than its parent");
-  offs[slots] = std::int32_t(elems);
-  ob->size_bytes = (slots + 1) * 4;
-  auto st = set_validity(arr, valid, slots, nulls);
+  if (auto k = nanom::columnar::list_slots(rep, def, entries, nd, expected, reinterpret_cast<std::int32_t*>(ob->data),
+                                           valid.data(), nulls, elems);
+      !k)
+    return fail("list '" + n.name + "': " + k.error);
+  ob->size_bytes = (expected + 1) * 4;
+  auto st = set_validity(arr, valid, expected, nulls);
   if (!st) return st;
-  arr->length = slots;
+  arr->length = expected;
   return build(f, n.children[0], levels, arr->children[0], n.rep_elem, n.def_elem, elems);
 }
 

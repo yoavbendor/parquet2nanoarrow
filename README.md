@@ -5,12 +5,18 @@ Read Apache Parquet files into Arrow C Data Interface arrays (`ArrowSchema` / `A
 goes to pyarrow, polars, DuckDB or any Arrow consumer without a copy.
 
 It is the read-side sibling of [nanoarrow2parquet](https://github.com/yoavbendor/nanoarrow2parquet).
-All decoding comes from [nanom](https://github.com/yoavbendor/nanom):
+All decoding comes from [nanom](https://github.com/yoavbendor/nanom). This repository keeps only
+the Parquet framing (which encoding applies to which page part), the Arrow output and the API:
 
 - the footer and page headers are nanom's reflected Thrift model (`nanom/formats/parquet_thrift.hpp`);
-- pages are decoded by nanom's columnar kernels (`nanom/columnar.hpp`) and its dependency-free
-  Snappy and LZ4 codecs (`nanom/codec.hpp`);
-- zstd and zlib cover the remaining codecs.
+- bits become integers with nanom's columnar kernels (`nanom/columnar.hpp`): bit unpacking, the
+  RLE / bit-packed hybrid, DELTA_BINARY_PACKED, BYTE_STREAM_SPLIT;
+- integers and bytes become values with nanom's value kernels (`nanom/values.hpp`): levels and
+  validity bitmaps, Dremel record assembly, null spreading, PLAIN / DELTA_LENGTH / DELTA_BYTE_ARRAY
+  byte arrays into offsets + data, dictionary gathers, UTF-8 validation, decimal widening (plus
+  `nanom/formats/parquet_values.hpp` for INT96 and dictionary-index framing);
+- Snappy and LZ4 are nanom's dependency-free codecs (`nanom/codec.hpp`); zstd and zlib cover ZSTD
+  and GZIP.
 
 ```cpp
 #include <parquet2nanoarrow/parquet2nanoarrow.hpp>
