@@ -114,18 +114,18 @@ The target is at least 1.02x on every file, both ways.
 
 | file | warm, mean of 5 | first read, mean of 5 |
 |---|---:|---:|
-| nested: list<int64> + struct<int64,string>, snappy | 1.53x | 1.43x |
-| int64 x4, plain, uncompressed | 1.60x | 2.77x |
-| int64 x4, snappy | 1.03x | 1.63x |
-| float64 x4, zstd | 1.09x | 1.36x |
-| nullable int + double, snappy | 1.32x | 1.25x |
-| strings, dictionary, snappy | 1.09x | 1.29x |
-| strings, plain, zstd | 1.07x | 1.15x |
-| mixed, lz4_raw, page v2 | 1.91x | 2.17x |
+| nested: list<int64> + struct<int64,string>, snappy | 1.44x | 1.43x |
+| int64 x4, plain, uncompressed | 1.51x | 2.67x |
+| int64 x4, snappy | 1.15x | 1.52x |
+| float64 x4, zstd | 1.17x | 1.44x |
+| nullable int + double, snappy | 1.32x | 1.45x |
+| strings, dictionary, snappy | 1.26x | 1.34x |
+| strings, plain, zstd | 1.03x | 1.23x |
+| mixed, lz4_raw, page v2 | 1.79x | 2.17x |
 
 All of this is from one shared 4-core cloud container, so treat it as indicative: single runs on this
-host vary by up to about ±25%. The thinnest warm margin is int64/snappy, where the Snappy decoder itself
-is still slower than Rust's `snap` crate.
+host vary by up to about ±25%. The thinnest warm margin is strings/plain/zstd (1.03x; 1.07x in the
+previous full run), where most of the time is zstd itself.
 
 With `read_options::threads = 4` (arrow-rs single-threaded, as above), files of 4 columns read
 3.5–4x faster than with one thread. A file whose time is mostly one column gains less (the
