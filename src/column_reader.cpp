@@ -352,14 +352,21 @@ class chunk_decoder {
     if (!h.data_page_header->has_value()) return fail("data page without its header");
     const auto& dh = **h.data_page_header;
     if (*dh.num_values < 0) return fail("negative page value count");
-    if (l_.max_def == 0 && *dh.encoding == Encoding::PLAIN) {
+    if (*dh.encoding == Encoding::PLAIN) {
       bool done = false;
-      auto st = direct_plain(codec_, body, std::size_t(*h.uncompressed_page_size), std::size_t(*dh.num_values), done);
+      auto st = l_.max_def == 0
+                    ? direct_plain(codec_, body, std::size_t(*h.uncompressed_page_size), std::size_t(*dh.num_values), done)
+                    : in_place_v1(dh, body, std::size_t(*h.uncompressed_page_size), done);
       if (!st || done) return st;
     }
     bytes_span page;
     auto st = decompress(codec_, body, std::size_t(*h.uncompressed_page_size), page_buf_, page);
     if (!st) return st;
+    return v1_levels_and_values(dh, page);
+  }
+
+  /// Split a decompressed v1 page into its levels and values, then decode them.
+  status v1_levels_and_values(const pq::DataPageHeader& dh, bytes_span page) {
     bytes_span rep_lv, def;
     if (l_.max_rep > 0) {
       if (*dh.repetition_level_encoding != Encoding::RLE)
@@ -413,30 +420,124 @@ class chunk_decoder {
     done = false;
     if (keep_ || l_.kind != conv::copy || codec == CompressionCodec::UNCOMPRESSED || l_.out_width == 0) return ok();
     if (std::int64_t(n) > cap_ - row_ || out_size != n * l_.out_width) return ok();
+    if (!direct_codec(codec)) return ok();  // other codecs take the staged path
     std::span<std::byte> target(reinterpret_cast<std::byte*>(data_->data) + std::size_t(row_) * l_.out_width, out_size);
-    switch (codec) {
-      case CompressionCodec::SNAPPY: {
-        auto r = nanom::codec::snappy_decompress(body, target);
-        if (!r) return fail(std::string("page decompression failed: ") + r.error().what);
-        break;
-      }
-      case CompressionCodec::LZ4_RAW: {
-        auto r = nanom::codec::lz4_block_decompress(body, target);
-        if (!r || *r != out_size) return fail("page decompression failed: lz4");
-        break;
-      }
-      case CompressionCodec::ZSTD: {
-        const std::size_t r = ZSTD_decompress(target.data(), target.size(), body.data(), body.size());
-        if (ZSTD_isError(r) || r != out_size) return fail("page decompression failed: zstd");
-        break;
-      }
-      default:
-        return ok();  // other codecs take the staged path
-    }
+    auto st = decompress_into(codec, body, target);
+    if (!st) return st;
     row_ += std::int64_t(n);
     entries_ += std::int64_t(n);
     done = true;
     return ok();
+  }
+
+  static bool direct_codec(CompressionCodec c) {
+    return c == CompressionCodec::SNAPPY || c == CompressionCodec::LZ4_RAW || c == CompressionCodec::ZSTD;
+  }
+  /// Decompress into exactly `target` (a direct_codec codec).
+  static status decompress_into(CompressionCodec codec, bytes_span body, std::span<std::byte> target) {
+    switch (codec) {
+      case CompressionCodec::SNAPPY: {
+        auto r = nanom::codec::snappy_decompress(body, target);
+        if (!r) return fail(std::string("page decompression failed: ") + r.error().what);
+        return ok();
+      }
+      case CompressionCodec::LZ4_RAW: {
+        auto r = nanom::codec::lz4_block_decompress(body, target);
+        if (!r || *r != target.size()) return fail("page decompression failed: lz4");
+        return ok();
+      }
+      case CompressionCodec::ZSTD: {
+        const std::size_t r = ZSTD_decompress(target.data(), target.size(), body.data(), body.size());
+        if (ZSTD_isError(r) || r != target.size()) return fail("page decompression failed: zstd");
+        return ok();
+      }
+      default:
+        return fail("internal: decompress_into codec");
+    }
+  }
+
+  /// PLAIN fixed-width v1 page of a flat optional column: [u32 len][def levels][values]. Guess
+  /// that the page has no nulls, so the values are its last n * width bytes, and decompress the
+  /// whole page to start (4 + len) bytes BEFORE this page's rows in the Arrow buffer: the values
+  /// then land in place and the staging copy disappears. The few bytes in front (earlier rows'
+  /// values) are saved and restored around it; the level prefix is copied out first. When the
+  /// guess is wrong (the prefix is not where the values start) the page is rebuilt in the
+  /// staging buffer and decoded normally. Returns with done == false (nothing touched) when the
+  /// page does not qualify.
+  status in_place_v1(const pq::DataPageHeader& dh, bytes_span body, std::size_t size, bool& done) {
+    static constexpr std::size_t kMaxPrefix = 64;
+    done = false;
+    const std::size_t w = l_.out_width, n = std::size_t(*dh.num_values);
+    if (keep_ || l_.max_rep != 0 || l_.kind != conv::copy || w == 0 || w != l_.phys_width ||
+        !direct_codec(codec_) || *dh.definition_level_encoding != Encoding::RLE)
+      return ok();
+    if (std::int64_t(n) > cap_ - row_ || size < n * w || size - n * w < 4 || size - n * w > kMaxPrefix ||
+        std::size_t(row_) * w < size - n * w)
+      return ok();
+    const std::size_t pre_n = size - n * w;
+    std::byte* const dst = reinterpret_cast<std::byte*>(data_->data) + std::size_t(row_) * w;
+    std::byte* const base = dst - pre_n;
+    std::byte saved[kMaxPrefix], pre[kMaxPrefix];
+    std::memcpy(saved, base, pre_n);
+    auto st = decompress_into(codec_, body, std::span<std::byte>(base, size));
+    std::memcpy(pre, base, pre_n);
+    std::memcpy(base, saved, pre_n);
+    if (!st) return st;
+    done = true;
+    const std::uint32_t len = le32(pre);
+    if (std::size_t(len) + 4 != pre_n) {
+      // the guess was wrong: reassemble the page and take the staged path
+      page_buf_.resize(size);
+      std::memcpy(page_buf_.data(), pre, pre_n);
+      std::memcpy(page_buf_.data() + pre_n, dst, size - pre_n);
+      return v1_levels_and_values(dh, bytes_span(page_buf_));
+    }
+    return page_values(n, {}, bytes_span(pre + 4, len), Encoding::PLAIN, bytes_span(dst, n * w), -1);
+  }
+
+  /// Decode n RLE / bit-packed levels (each <= maxv) into out, run by run: an RLE run is a fill,
+  /// a bit-packed run is unpacked in blocks. Returns null on success, else what went wrong.
+  const char* decode_levels(bytes_span data, std::int16_t maxv, std::size_t n, std::uint16_t* out) {
+    const unsigned w = unsigned(std::bit_width(unsigned(maxv)));
+    col::rle_bp_decoder d(data, w);
+    col::rle_bp_decoder::run lr;
+    std::uint32_t tmp[512];
+    for (std::size_t i = 0; i < n; i += lr.count) {
+      if (!d.next_run(lr, n - i)) return "shorter than the page";
+      if (!lr.packed) {
+        if (lr.value > std::uint32_t(maxv)) return "level above the column's maximum";
+        std::fill_n(out + i, lr.count, std::uint16_t(lr.value));
+        continue;
+      }
+      std::uint32_t hi = 0;
+      if (lr.bit_offset == 0) {
+        for (std::size_t k = 0; k < lr.count; k += 512) {
+          const std::size_t m = std::min<std::size_t>(512, lr.count - k);
+          const std::size_t byte = k * w / 8;  // k is a multiple of 8: a whole-byte position
+          if (!col::unpack_bits<std::uint32_t>(lr.bits.subspan(byte), w, std::span<std::uint32_t>(tmp), m))
+            return "shorter than the page";
+          for (std::size_t j = 0; j < m; ++j) {
+            hi |= tmp[j] > std::uint32_t(maxv) ? 1u : 0u;
+            out[i + k + j] = std::uint16_t(tmp[j]);
+          }
+        }
+      } else {  // a run resumed mid-byte (not produced by one pass, kept for generality)
+        const auto* b = reinterpret_cast<const std::uint8_t*>(lr.bits.data());
+        for (std::size_t k = 0; k < lr.count; ++k) {
+          const std::size_t bit = lr.bit_offset + k * w;
+          std::uint32_t v = 0;
+          for (unsigned t = 0; t < w; ++t) {
+            const std::size_t q = bit + t;
+            if (q / 8 >= lr.bits.size()) return "shorter than the page";
+            v |= std::uint32_t((b[q / 8] >> (q % 8)) & 1) << t;
+          }
+          hi |= v > std::uint32_t(maxv) ? 1u : 0u;
+          out[i + k] = std::uint16_t(v);
+        }
+      }
+      if (hi) return "level above the column's maximum";
+    }
+    return nullptr;
   }
 
   /// Nested leaf: decode this page's rep/def levels, append them to keep_, and build the page's
@@ -444,25 +545,20 @@ class chunk_decoder {
   /// count in `slots` and the non-null count in `nn`.
   status nested_levels(std::size_t n, bytes_span rep, bytes_span def, std::size_t& slots, std::size_t& nn) {
     const std::size_t base = keep_->def.size();
-    level_buf_.resize(n);
+    keep_->rep.resize(base + n);
+    keep_->def.resize(base + n);
+    std::uint16_t* const rl = keep_->rep.data() + base;
+    std::uint16_t* const dl0 = keep_->def.data() + base;
     if (l_.max_rep > 0) {
-      col::rle_bp_decoder d(rep, unsigned(std::bit_width(unsigned(l_.max_rep))));
-      if (d.get(level_buf_.data(), n) != n || !d.ok()) return fail("repetition levels shorter than the page");
-      for (std::size_t i = 0; i < n; ++i)
-        if (level_buf_[i] > std::uint32_t(l_.max_rep)) return fail("repetition level above the column's maximum");
-      if (n && entries_ == 0 && level_buf_[0] != 0) return fail("column chunk does not start at a row boundary");
-      keep_->rep.insert(keep_->rep.end(), level_buf_.begin(), level_buf_.end());
+      if (const char* e = decode_levels(rep, l_.max_rep, n, rl)) return fail(std::string("repetition levels: ") + e);
+      if (n && entries_ == 0 && rl[0] != 0) return fail("column chunk does not start at a row boundary");
     } else {
-      keep_->rep.resize(base + n, 0);
+      std::fill_n(rl, n, std::uint16_t(0));
     }
     if (l_.max_def > 0) {
-      col::rle_bp_decoder d(def, unsigned(std::bit_width(unsigned(l_.max_def))));
-      if (d.get(level_buf_.data(), n) != n || !d.ok()) return fail("definition levels shorter than the page");
-      for (std::size_t i = 0; i < n; ++i)
-        if (level_buf_[i] > std::uint32_t(l_.max_def)) return fail("definition level above the column's maximum");
-      keep_->def.insert(keep_->def.end(), level_buf_.begin(), level_buf_.end());
+      if (const char* e = decode_levels(def, l_.max_def, n, dl0)) return fail(std::string("definition levels: ") + e);
     } else {
-      keep_->def.resize(base + n, 0);
+      std::fill_n(dl0, n, std::uint16_t(0));
     }
     const std::uint16_t* dl = keep_->def.data() + base;
     pv_.assign(((n + 63) / 64) * 8, std::uint8_t(0));
@@ -689,7 +785,7 @@ class chunk_decoder {
     switch (enc) {
       case Encoding::PLAIN:
         if (nn > vals.size() / w) return fail("PLAIN page shorter than its values");
-        if (nn) std::memcpy(dst, vals.data(), nn * w);
+        if (nn && vals.data() != dst) std::memcpy(dst, vals.data(), nn * w);  // in_place_v1: already there
         return ok();
       case Encoding::PLAIN_DICTIONARY:
       case Encoding::RLE_DICTIONARY: {
@@ -793,34 +889,51 @@ class chunk_decoder {
     const std::span<std::byte> out(bits, std::size_t((cap_ + 7) / 8));
     if (enc == Encoding::PLAIN && nn == n)
       return col::copy_bits(vals, n, out, std::size_t(row_)) ? ok() : fail("PLAIN boolean page shorter than its values");
-    dense_bits_.resize(nn);
+    // the nn values as a dense bitmap: PLAIN pages are one already; RLE pages are expanded run by
+    // run (an RLE run is a range fill, a bit-packed run of width 1 is a bitmap slice)
+    bytes_span dense;
     if (enc == Encoding::PLAIN) {
       if (vals.size() < (nn + 7) / 8) return fail("PLAIN boolean page shorter than its values");
-      for (std::size_t i = 0; i < nn; ++i) dense_bits_[i] = (std::uint8_t(vals[i / 8]) >> (i % 8)) & 1;
+      dense = vals;
     } else if (enc == Encoding::RLE) {
       if (vals.size() < 4) return fail("truncated RLE boolean page");
       const std::uint32_t len = le32(vals.data());
       if (len > vals.size() - 4) return fail("RLE boolean run data past the page");
+      dense_bits_.assign((nn + 7) / 8 + 8, 0);
+      std::uint8_t* db = dense_bits_.data();
       col::rle_bp_decoder d(vals.subspan(4, len), 1);
-      std::uint32_t buf[1024];
-      std::size_t done = 0;
-      while (done < nn) {
-        const std::size_t k = d.get(buf, std::min<std::size_t>(1024, nn - done));
-        if (!k) return fail("RLE boolean page shorter than its values");
-        for (std::size_t i = 0; i < k; ++i) dense_bits_[done + i] = std::uint8_t(buf[i]);
-        done += k;
+      col::rle_bp_decoder::run lr;
+      for (std::size_t i = 0; i < nn; i += lr.count) {
+        if (!d.next_run(lr, nn - i)) return fail("RLE boolean page shorter than its values");
+        if (!lr.packed) {
+          if (lr.value > 1) return fail("RLE boolean value above 1");
+          if (lr.value) set_bits(db, i, lr.count);
+        } else if (lr.bit_offset == 0) {
+          if (!col::copy_bits(lr.bits, lr.count, std::as_writable_bytes(std::span(dense_bits_)), i))
+            return fail("RLE boolean page shorter than its values");
+        } else {
+          for (std::size_t k = 0; k < lr.count; ++k) {
+            const std::size_t b = lr.bit_offset + k;
+            if ((std::uint8_t(lr.bits[b / 8]) >> (b % 8)) & 1) db[(i + k) / 8] = std::uint8_t(db[(i + k) / 8] | (1u << ((i + k) % 8)));
+          }
+        }
       }
+      if (nn == n)
+        return col::copy_bits(std::as_bytes(std::span(dense_bits_)), n, out, std::size_t(row_)) ? ok()
+                                                                                              : fail("internal: boolean bitmap");
+      dense = std::as_bytes(std::span(dense_bits_));
     } else {
       return fail(enc_name(enc) + " is not supported for BOOLEAN");
     }
+    // nulls: place value j at the j-th valid row (null rows stay 0)
     std::size_t j = 0;
     auto* o = reinterpret_cast<std::uint8_t*>(bits);
+    const auto* dv = reinterpret_cast<const std::uint8_t*>(dense.data());
     for (std::size_t r = 0; r < n; ++r) {
       if (!valid(r)) continue;
-      if (dense_bits_[j++]) {
-        const std::size_t b = std::size_t(row_) + r;
-        o[b / 8] = std::uint8_t(o[b / 8] | (1u << (b % 8)));
-      }
+      const std::size_t b = std::size_t(row_) + r;
+      o[b / 8] = std::uint8_t(o[b / 8] | (((dv[j / 8] >> (j % 8)) & 1u) << (b % 8)));
+      ++j;
     }
     return ok();
   }
@@ -1068,7 +1181,7 @@ class chunk_decoder {
     std::vector<std::byte> dict_fixed, dict_data, page_buf, dense;
     std::vector<std::size_t> dict_off;
     std::vector<std::uint8_t> dense_bits, pv;
-    std::vector<std::uint32_t> levels, level_buf, idx;
+    std::vector<std::uint32_t> levels, idx;
     std::vector<std::string_view> views;
     std::vector<std::int32_t> lengths, prefix;
     std::vector<char> arena;
@@ -1085,7 +1198,6 @@ class chunk_decoder {
   std::vector<std::byte>& dense_ = s_.dense;
   std::vector<std::uint8_t>& dense_bits_ = s_.dense_bits;
   std::vector<std::uint32_t>& levels_ = s_.levels;
-  std::vector<std::uint32_t>& level_buf_ = s_.level_buf;
   std::vector<std::uint8_t>& pv_ = s_.pv;  ///< page-local validity bits, padded to whole 64-bit words
   std::vector<std::string_view>& views_ = s_.views;
   std::vector<std::int32_t>& lengths_ = s_.lengths;

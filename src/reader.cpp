@@ -5,6 +5,11 @@
 // ArrowArrayStream export.
 #include "internal.hpp"
 
+#include <algorithm>
+#include <atomic>
+#include <optional>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 
 namespace p2n {
@@ -150,23 +155,59 @@ status reader::read_row_group(std::size_t index, ArrowArray* out) const {
     return fail(std::string("cannot allocate the output array: ") + aerr.message);
   }
   sch.release(&sch);
-  std::vector<leaf_levels> levels;
-  for (std::size_t i = 0; i < columns_.size(); ++i) {
+  // Output columns are independent: each is decoded into its own child array, by one thread.
+  // Workers take the next column from a shared counter; the first failing column (by index) wins.
+  const auto decode_column = [&](std::size_t i, std::vector<leaf_levels>& levels) -> status {
     const anode& n = *column_node(i);
     if (n.flat()) {
       const leaf& l = file_->leaves[std::size_t(n.leaf)];
-      st = read_column_chunk(*file_, l, (*chunks)[std::size_t(l.index)], rows, 0, nullptr, options_, out->children[i]);
-    } else {
-      // nested: decode every leaf below (keeping its levels), then assemble the structure
-      levels.assign(file_->leaves.size(), {});
-      st = decode_leaves(n, *chunks, rows, levels, out->children[i]);
-      if (st) st = assemble_nested(*file_, n, levels, rows, out->children[i]);
+      return read_column_chunk(*file_, l, (*chunks)[std::size_t(l.index)], rows, 0, nullptr, options_, out->children[i]);
     }
-    if (!st) {
-      out->release(out);
-      return fail("row group " + std::to_string(index) + ": " + st.error().message);
+    // nested: decode every leaf below (keeping its levels), then assemble the structure
+    levels.assign(file_->leaves.size(), {});
+    auto s = decode_leaves(n, *chunks, rows, levels, out->children[i]);
+    if (s) s = assemble_nested(*file_, n, levels, rows, out->children[i]);
+    return s;
+  };
+  const std::size_t ncols = columns_.size();
+  unsigned threads = options_.threads ? options_.threads : std::max(1u, std::thread::hardware_concurrency());
+  threads = unsigned(std::min<std::size_t>(threads, ncols));
+  std::vector<std::optional<error>> errors(ncols);
+  if (threads <= 1) {
+    std::vector<leaf_levels> levels;
+    for (std::size_t i = 0; i < ncols; ++i)
+      if (auto s = decode_column(i, levels); !s) {
+        errors[i] = std::move(s.error());
+        break;
+      }
+  } else {
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> failed{false};
+    const auto work = [&] {
+      std::vector<leaf_levels> levels;
+      for (std::size_t i; !failed.load(std::memory_order_relaxed) && (i = next.fetch_add(1)) < ncols;) {
+        auto s = decode_column(i, levels);
+        if (!s) {
+          errors[i] = std::move(s.error());
+          failed.store(true, std::memory_order_relaxed);
+        }
+      }
+    };
+    std::vector<std::jthread> pool;
+    pool.reserve(threads - 1);
+    try {
+      for (unsigned t = 1; t < threads; ++t) pool.emplace_back(work);
+    } catch (const std::system_error&) {
+      // no more threads available: the ones started and this one finish the work
     }
+    work();
+    pool.clear();  // join
   }
+  for (std::size_t i = 0; i < ncols; ++i)
+    if (errors[i]) {
+      out->release(out);
+      return fail("row group " + std::to_string(index) + ": " + errors[i]->message);
+    }
   out->length = rows;
   out->null_count = 0;
   if (ArrowArrayFinishBuildingDefault(out, &aerr) != NANOARROW_OK) {

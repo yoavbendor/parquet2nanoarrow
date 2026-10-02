@@ -21,6 +21,11 @@ struct ArrowArrayStream;
 int p2n_open_stream(const char* path, const char* const* columns, int n_columns, int skip_unsupported,
                     struct ArrowArrayStream* out, char* err, size_t err_len);
 
+/* As p2n_open_stream, decoding the columns of each row group on `threads` threads
+ * (read_options::threads: 1 = the calling thread only, 0 = one per hardware thread). */
+int p2n_open_stream_ex(const char* path, const char* const* columns, int n_columns, int skip_unsupported,
+                       unsigned threads, struct ArrowArrayStream* out, char* err, size_t err_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -36,9 +36,12 @@ N = 2500  # rows per file: enough for several pages at data_page_size=1024
 class P2N:
     def __init__(self, lib_path):
         self.lib = ctypes.CDLL(lib_path)
-        self.lib.p2n_open_stream.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
-                                             ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-        self.lib.p2n_open_stream.restype = ctypes.c_int
+        self.lib.p2n_open_stream_ex.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_uint, ctypes.c_void_p, ctypes.c_char_p,
+                                                ctypes.c_size_t]
+        self.lib.p2n_open_stream_ex.restype = ctypes.c_int
+        # P2N_THREADS=k decodes each row group's columns on k threads (the results must not change)
+        self.threads = int(os.environ.get("P2N_THREADS", "1"))
 
     def read(self, path, columns=None, skip_unsupported=True):
         stream = ffi.new("struct ArrowArrayStream*")
@@ -49,7 +52,8 @@ class P2N:
         if columns:
             n = len(columns)
             cols = (ctypes.c_char_p * n)(*[c.encode() for c in columns])
-        rc = self.lib.p2n_open_stream(path.encode(), cols, n, int(skip_unsupported), addr, err, len(err))
+        rc = self.lib.p2n_open_stream_ex(path.encode(), cols, n, int(skip_unsupported), self.threads, addr, err,
+                                         len(err))
         if rc != 0:
             raise RuntimeError(err.value.decode())
         return pa.RecordBatchReader._import_from_c(addr).read_all()
@@ -62,6 +66,8 @@ def null_mask(rng, n, kind):
         return [True] * n
     if kind == "sparse":
         return [rng.random() < 0.02 for _ in range(n)]
+    if kind == "rare":  # about one null per small page: exercises the in-place v1 fallback
+        return [rng.random() < 0.004 for _ in range(n)]
     return [rng.random() < 0.4 for _ in range(n)]
 
 
@@ -164,6 +170,10 @@ CASES = [
     ("dict_zstd_v2", dict(compression="zstd", data_page_version="2.0")),
     ("plain_gzip_v2", dict(compression="gzip", use_dictionary=False, data_page_version="2.0")),
     ("lz4raw_multipage", dict(compression="lz4", data_page_size=1024, row_group_size=700)),
+    # PLAIN v1 pages of optional columns: decompressed in place into the output buffer
+    ("plain_snappy_pages", dict(compression="snappy", use_dictionary=False, data_page_size=1024)),
+    ("plain_zstd_pages", dict(compression="zstd", use_dictionary=False, data_page_size=2048)),
+    ("plain_lz4_pages", dict(compression="lz4", use_dictionary=False, data_page_size=512)),
     ("delta_ints", dict(compression="snappy", use_dictionary=False,
                         column_encoding={c: "DELTA_BINARY_PACKED" for c in INT_COLS})),
     ("delta_strings", dict(compression="none", use_dictionary=False,
@@ -204,7 +214,7 @@ def main():
     failures, files = [], 0
     with tempfile.TemporaryDirectory() as d:
         for name, cfg in CASES:
-            for nulls in ("none", "sparse", "dense", "all"):
+            for nulls in ("none", "rare", "sparse", "dense", "all"):
                 table = make_table(rng, nulls)
                 path = os.path.join(d, f"{name}_{nulls}.parquet")
                 try:

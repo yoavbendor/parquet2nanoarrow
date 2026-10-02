@@ -25,6 +25,23 @@ ArrowArray batch;                 // or pull row groups yourself
 r->read_row_group(0, &batch);
 ```
 
+Rows can also be read straight into a struct. The struct's fields are the projection, and the
+column types are checked against them once, at open:
+
+```cpp
+#include <parquet2nanoarrow/typed.hpp>
+
+struct trip { std::int64_t id; double fare; std::optional<std::string_view> note; };
+NANOM_DESCRIBE(trip, id, fare, note);
+
+auto r = p2n::typed_reader<trip>::open("trips.parquet");   // reads columns id, fare, note
+double total = 0;
+r->for_each([&](const trip& t) { total += t.fare; });     // or read_row_group(g), then index / iterate
+```
+
+`read_options::threads` decodes the columns of each row group in parallel (1 by default; 0 = one
+per hardware thread).
+
 A C ABI (`parquet2nanoarrow.h`, `libparquet2nanoarrow_c.so`) exposes the same stream to other
 languages. From Python with no bindings package:
 
@@ -56,7 +73,7 @@ table = pa.RecordBatchReader._import_from_c(int(ffi.cast("uintptr_t", stream))).
 - encrypted files;
 - reading the embedded `ARROW:schema`, so a timestamp's original non-UTC timezone and other
   Arrow-only type details are not restored;
-- multi-threaded decoding (arrow-rs has none built in either; it is the next lever beyond parity).
+- decoding one column chunk on several threads (threads split the columns of a row group).
 
 ## Safety
 
@@ -75,7 +92,9 @@ The file is untrusted input.
 
 | check | what it proves |
 |---|---|
-| `tests/differential.py` | 81 pyarrow-written files covering every type, encoding, codec, page version and null density above, plus 21 files of nested columns (lists of structs, structs of lists, maps of lists, lists of lists, three-deep structs; nulls and empty lists at every level). Each is read through the C ABI and imported into pyarrow via the C Data Interface. Every table must equal `pyarrow.parquet.read_table` exactly: schema, nullability, values and null positions (floats by bit pattern). It also checks projection, unsupported-column errors and empty files. |
+| `tests/differential.py` | 110 pyarrow-written files covering every type, encoding, codec, page version and null density above, plus 21 files of nested columns (lists of structs, structs of lists, maps of lists, lists of lists, three-deep structs; nulls and empty lists at every level). Each is read through the C ABI and imported into pyarrow via the C Data Interface. Every table must equal `pyarrow.parquet.read_table` exactly: schema, nullability, values and null positions (floats by bit pattern). It also checks projection, unsupported-column errors and empty files. |
+| `tests/typed.py` | `typed_reader<Row>` rows equal pyarrow's values. Nulls in a non-optional field, a field whose type does not fit its column, and a missing column are reported as errors. |
+| threads | the differential suite also runs with 4 decode threads (`P2N_THREADS=4`), and the whole parquet-testing corpus runs clean under ThreadSanitizer with 4 threads |
 | `tests/parquet_testing.py` | every file of [apache/parquet-testing](https://github.com/apache/parquet-testing) (pinned): files from parquet-mr, Spark, Impala, Arrow and others, incl. legacy list/map layouts and writer bugs (PARQUET-816 chunk sizes, concatenated gzip members, reused Thrift field ids). Result: **76 files equal pyarrow's output exactly, 5 are rejected by both libraries, 0 mismatches**. |
 | `fuzz/fuzz_reader.cpp` + `tests/make_fuzz_seeds.py` | the whole reader on mutated files (footer-biased bit flips, overwrites, truncation, splices) under ASan/UBSan. 200,000 mutated files ran with no crash; about 50,000 row groups still decoded and the rest were rejected with errors. |
 | nanom's own suites | the Thrift model against pyarrow footers, and the kernels and codecs against reference implementations, pyarrow's compressors and fuzzing |
@@ -95,23 +114,30 @@ The target is at least 1.02x on every file, both ways.
 
 | file | warm, mean of 5 | first read, mean of 5 |
 |---|---:|---:|
-| nested: list<int64> + struct<int64,string>, snappy | 1.39x | 1.26x |
-| int64 x4, plain, uncompressed | 1.43x | 2.28x |
-| int64 x4, snappy | 1.05x | 1.43x |
-| float64 x4, zstd | 1.04x | 1.31x |
-| nullable int + double, snappy | 1.08x | 1.16x |
-| strings, dictionary, snappy | 1.12x | 1.37x |
-| strings, plain, zstd | 1.17x | 1.39x |
-| mixed, lz4_raw, page v2 | 1.15x | 1.46x |
+| nested: list<int64> + struct<int64,string>, snappy | 1.53x | 1.43x |
+| int64 x4, plain, uncompressed | 1.60x | 2.77x |
+| int64 x4, snappy | 1.03x | 1.63x |
+| float64 x4, zstd | 1.09x | 1.36x |
+| nullable int + double, snappy | 1.32x | 1.25x |
+| strings, dictionary, snappy | 1.09x | 1.29x |
+| strings, plain, zstd | 1.07x | 1.15x |
+| mixed, lz4_raw, page v2 | 1.91x | 2.17x |
 
-All of this is from one shared 4-core cloud container, so treat it as indicative. Single runs vary by
-up to about ±5%. Three warm margins are thin: float64/zstd (one run at 0.99x), int64/snappy and nullable.
+All of this is from one shared 4-core cloud container, so treat it as indicative: single runs on this
+host vary by up to about ±25%. The thinnest warm margin is int64/snappy, where the Snappy decoder itself
+is still slower than Rust's `snap` crate.
+
+With `read_options::threads = 4` (arrow-rs single-threaded, as above), files of 4 columns read
+3.5–4x faster than with one thread. A file whose time is mostly one column gains less (the
+two-column strings file gains 1.45x).
 
 What it rests on:
 - **Memory:** the input file is memory-mapped. Uncompressed pages are decoded straight from the
-  mapping, and PLAIN pages without levels are decompressed directly into the Arrow buffer.
+  mapping, and PLAIN pages are decompressed directly into the Arrow buffer. That includes the v1 pages
+  of nullable columns: the page is placed so its values land on their rows, and the level bytes in
+  front are saved and restored.
 - **Levels:** definition levels become the validity bitmap run by run, and values are spread over
-  null slots 64 rows at a time.
+  null slots 64 rows at a time. Nested levels and RLE booleans are also decoded run by run.
 - **Strings:** a dictionary is UTF-8-checked once and PLAIN pages in one bulk pass. Strings are
   copied in a single pass with fixed 16-byte moves.
 - **Codecs:** Snappy and LZ4 use table-driven decoding with wild-copy fast paths.

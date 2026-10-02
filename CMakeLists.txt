@@ -33,7 +33,7 @@ endif()
 if(NOT TARGET nanom::nanom)
     FetchContent_Declare(nanom
         GIT_REPOSITORY https://github.com/yoavbendor/nanom.git
-        GIT_TAG b96d1a46b233e8a4255893d22be41189951e8727
+        GIT_TAG eebe4cc9e5b1e1731abe1a2b689cdce2ff022aeb
     )
     FetchContent_GetProperties(nanom)
     if(NOT nanom_POPULATED)
@@ -102,8 +102,9 @@ add_library(parquet2nanoarrow STATIC
 add_library(parquet2nanoarrow::parquet2nanoarrow ALIAS parquet2nanoarrow)
 target_include_directories(parquet2nanoarrow PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+find_package(Threads REQUIRED)
 target_link_libraries(parquet2nanoarrow PUBLIC nanom::nanom ${P2N_NANOARROW_TARGET}
-                                        PRIVATE ${P2N_ZSTD_TARGET})
+                                        PRIVATE ${P2N_ZSTD_TARGET} Threads::Threads)
 if(ZLIB_FOUND)
     target_link_libraries(parquet2nanoarrow PRIVATE ZLIB::ZLIB)
     target_compile_definitions(parquet2nanoarrow PRIVATE P2N_HAVE_ZLIB=1)
@@ -125,6 +126,7 @@ if(P2N_BUILD_TESTS)
     p2n_exe(p2n_cat tools/p2n_cat.cpp)
     p2n_exe(p2n_bench bench/bench_read.cpp)
     p2n_exe(p2n_fuzz fuzz/fuzz_reader.cpp)
+    p2n_exe(p2n_typed_read examples/typed_read.cpp)
     target_compile_definitions(p2n_fuzz PRIVATE P2N_FUZZ_STANDALONE=1)
 
     find_package(Python3 COMPONENTS Interpreter QUIET)
@@ -133,6 +135,13 @@ if(P2N_BUILD_TESTS)
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/differential.py
                          $<TARGET_FILE:parquet2nanoarrow_c>)
         set_tests_properties(differential_pyarrow PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME differential_pyarrow_threads
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/differential.py
+                         $<TARGET_FILE:parquet2nanoarrow_c>)
+        set_tests_properties(differential_pyarrow_threads PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "P2N_THREADS=4")
+        add_test(NAME typed_reader
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/typed.py $<TARGET_FILE:p2n_typed_read>)
+        set_tests_properties(typed_reader PROPERTIES SKIP_RETURN_CODE 77)
         add_test(NAME fuzz_corrupted_files
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/make_fuzz_seeds.py
                          $<TARGET_FILE:p2n_fuzz>)

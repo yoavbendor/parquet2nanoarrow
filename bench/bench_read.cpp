@@ -21,6 +21,7 @@ int main(int argc, char** argv) {
   for (int i = 3; i < argc; ++i) opt.columns.emplace_back(argv[i]);
   opt.skip_unsupported = true;
   if (const char* v = std::getenv("P2N_VALIDATE_UTF8")) opt.validate_utf8 = v[0] != '0';
+  if (const char* v = std::getenv("P2N_THREADS")) opt.threads = unsigned(std::strtoul(v, nullptr, 10));
   double best = 1e30;
   std::int64_t rows = 0;
   for (int rep = 0; rep < reps; ++rep) {

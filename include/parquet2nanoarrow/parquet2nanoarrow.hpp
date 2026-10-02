@@ -58,6 +58,9 @@ struct read_options {
   /// Validate UTF-8 in string (utf8-annotated BYTE_ARRAY) columns. On by default: Arrow consumers
   /// may assume valid UTF-8 for "u" arrays, so a corrupt file must not hand them invalid text.
   bool validate_utf8 = true;
+  /// Threads that decode the columns of one row group in parallel (each column chunk is decoded
+  /// by one thread). 1 = decode on the calling thread only; 0 = one per hardware thread.
+  unsigned threads = 1;
 };
 
 /// One top-level output column, as resolved at open().

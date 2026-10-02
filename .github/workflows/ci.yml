@@ -61,3 +61,35 @@ jobs:
         env:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: python3 tests/make_fuzz_seeds.py build/p2n_fuzz 50000
+      - name: differential with 4 decode threads (sanitized)
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          P2N_THREADS: "4"
+        run: |
+          export LD_PRELOAD="$(g++-13 -print-file-name=libasan.so):$(g++-13 -print-file-name=libubsan.so)"
+          python3 tests/differential.py build/libparquet2nanoarrow_c.so
+
+  # Multi-threaded decoding under ThreadSanitizer: every parquet-testing file, 4 decode threads.
+  # (Run through p2n_bench rather than pyarrow, whose own uninstrumented threads TSan misreports.)
+  tsan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zlib1g-dev g++-13
+      - name: configure + build
+        run: |
+          cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=g++-13 -DCMAKE_BUILD_TYPE=RelWithDebInfo -DP2N_SANITIZER=thread -DP2N_PARQUET_TESTING=ON
+          cmake --build build --target p2n_bench
+      - name: corpus with 4 threads
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+          P2N_THREADS: "4"
+        run: |
+          for f in .deps/parquet_testing-src/data/*.parquet; do
+            build/p2n_bench "$f" 1 > /dev/null 2> err.txt || true
+            if grep -q ThreadSanitizer err.txt; then cat err.txt; exit 1; fi
+          done
