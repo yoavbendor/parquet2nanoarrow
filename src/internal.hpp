@@ -30,6 +30,8 @@ inline status ok() { return ok_t{}; }
 class mapped_file {
  public:
   static result<std::shared_ptr<mapped_file>> open(const std::filesystem::path& path);
+  /// A file held in memory, owned by this object (an s3:// object, read whole).
+  static result<std::shared_ptr<mapped_file>> from_bytes(std::vector<std::byte> bytes);
   ~mapped_file();
   mapped_file(const mapped_file&) = delete;
   mapped_file& operator=(const mapped_file&) = delete;
@@ -39,7 +41,14 @@ class mapped_file {
   mapped_file() = default;
   const std::byte* data_ = nullptr;
   std::size_t size_ = 0;
+  bool mapped_ = false;           ///< data_ is an mmap, unmapped on destruction
+  std::vector<std::byte> owned_;  ///< data_ points into this when the file was read into memory
 };
+
+/// Whether a path names an s3:// object.
+bool is_s3_uri(const std::string& path);
+/// The s3:// object read whole into memory (s3_source.cpp; built with -DP2N_S3=ON, else an error).
+result<std::shared_ptr<mapped_file>> open_s3(const std::string& uri);
 
 /// How a Parquet physical value becomes its Arrow value.
 enum class conv : std::uint8_t {

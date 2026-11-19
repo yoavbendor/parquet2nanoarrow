@@ -77,7 +77,8 @@ result<reader> reader::make(std::shared_ptr<const file> f, read_options options)
 }
 
 result<reader> reader::open(const std::filesystem::path& path, read_options options) {
-  auto m = mapped_file::open(path);
+  const std::string text = path.string();
+  auto m = is_s3_uri(text) ? open_s3(text) : mapped_file::open(path);
   if (!m) return nanom::unexpected<error>(m.error());
   const auto bytes = (*m)->bytes();
   auto f = file::load(std::move(*m), bytes);
