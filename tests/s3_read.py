@@ -66,19 +66,26 @@ def main():
         fs_args.update(endpoint_override=endpoint.netloc, scheme=endpoint.scheme or "https")
     fs = pafs.S3FileSystem(**fs_args)
 
-    with tempfile.TemporaryDirectory() as tmp:
-        local = os.path.join(tmp, "sample.parquet")
-        pq.write_table(table, local, row_group_size=15000)
-        want = pq.read_table(local)
-        with open(local, "rb") as src, fs.open_output_stream(f"{bucket}/{obj_key}") as dst:
-            dst.write(src.read())
+    # A wide table: its footer is larger than the first tail read (64 KiB), so the footer is read a second time.
+    wide = pa.table({f"c{i:04d}": pa.array(range(50), pa.int32()) for i in range(1500)})
 
-        from_local = read_p2n(lib, local)
-        from_s3 = read_p2n(lib, uri)
-        assert from_local.equals(want), "local read differs from pyarrow"
-        assert from_s3.equals(want), "s3 read differs from pyarrow"
-        print(f"s3 read: {from_s3.num_rows} rows in {pq.ParquetFile(local).num_row_groups} row groups, "
-              f"identical to the local read")
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, t, row_group_size in (("sample", table, 15000), ("wide", wide, None)):
+            local = os.path.join(tmp, f"{name}.parquet")
+            pq.write_table(t, local, row_group_size=row_group_size)
+            want = pq.read_table(local)
+            obj = f"{key}p2n-s3-{name}-{uuid.uuid4().hex}.parquet"
+            with open(local, "rb") as src, fs.open_output_stream(f"{bucket}/{obj}") as dst:
+                dst.write(src.read())
+            if name == "wide":
+                assert pq.ParquetFile(local).metadata.serialized_size > 65536, "the wide footer must exceed 64 KiB"
+
+            from_local = read_p2n(lib, local)
+            from_s3 = read_p2n(lib, f"s3://{bucket}/{obj}")
+            assert from_local.equals(want), f"{name}: local read differs from pyarrow"
+            assert from_s3.equals(want), f"{name}: s3 read differs from pyarrow"
+            print(f"s3 read {name}: {from_s3.num_rows} rows x {from_s3.num_columns} columns in "
+                  f"{pq.ParquetFile(local).num_row_groups} row groups, identical to the local read")
 
     try:
         read_p2n(lib, f"s3://{bucket}/{obj_key}.missing")

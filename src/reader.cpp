@@ -18,6 +18,7 @@ result<std::shared_ptr<file>> file::load(std::shared_ptr<mapped_file> mapping, s
   auto f = std::make_shared<file>();
   f->mapping = std::move(mapping);
   f->bytes = bytes;
+  f->size = bytes.size();
   const nanom::input in = f->input();
   auto md = pq::read_file_metadata(in);
   if (!md) return fail("not a readable Parquet file: " + md.error().render(in));
@@ -76,9 +77,73 @@ result<reader> reader::make(std::shared_ptr<const file> f, read_options options)
   return r;
 }
 
+namespace {
+
+constexpr std::byte kParquetMagic[4] = {std::byte{'P'}, std::byte{'A'}, std::byte{'R'}, std::byte{'1'}};
+
+}  // namespace
+
+result<std::shared_ptr<file>> file::load_remote(std::unique_ptr<byte_source> source) {
+  auto f = std::make_shared<file>();
+  f->size = source->size();
+  f->remote = std::move(source);
+  if (f->size < 12) return fail("not a readable Parquet file: too small to hold a footer");
+  // The footer length and the trailing magic are the last 8 bytes; the footer is the bytes before them.
+  const std::uint64_t tail_len = std::min(f->size, std::max<std::uint64_t>(f->remote->footer_read_size(), 8));
+  std::vector<std::byte> tail(static_cast<std::size_t>(tail_len));
+  std::string err;
+  if (!f->remote->read(f->size - tail_len, tail_len, tail.data(), err)) return fail("cannot read the footer: " + err);
+  if (!std::equal(tail.end() - 4, tail.end(), kParquetMagic)) return fail("not a Parquet file: no trailing PAR1");
+  std::uint32_t footer_len = 0;
+  for (int i = 0; i < 4; ++i)  // little-endian
+    footer_len |= std::uint32_t(static_cast<std::uint8_t>(tail[tail.size() - 8 + i])) << (8 * i);
+  if (footer_len > f->size - 8) return fail("footer length is larger than the file");
+  const std::uint64_t need = std::uint64_t(footer_len) + 8;
+  if (need > tail_len) {  // the footer did not fit in the first read: read exactly it
+    tail.assign(static_cast<std::size_t>(need), std::byte{0});
+    if (!f->remote->read(f->size - need, need, tail.data(), err)) return fail("cannot read the footer: " + err);
+  }
+  f->footer = std::move(tail);
+  // The footer is the last footer_len + 8 bytes of the tail; the metadata is the footer's first footer_len bytes.
+  const std::span<const std::byte> meta(f->footer.data() + (f->footer.size() - need), footer_len);
+  auto md = pq::thrift_compact<pq::FileMetaData>()(nanom::from(meta));
+  if (!md) return fail("not a readable Parquet file: " + md.error().render(nanom::from(meta)));
+  if (!md->rest.empty()) return fail("not a readable Parquet file: FileMetaData does not span the footer");
+  f->meta = std::move(md->value);
+  const nanom::input in = f->input();
+  auto rgs = f->meta.row_groups->to_vector();
+  if (!rgs) return fail("bad row group metadata: " + rgs.error().render(in));
+  f->row_groups = std::move(*rgs);
+  auto st = build_schema(*f);
+  if (!st) return nanom::unexpected<error>(st.error());
+  return f;
+}
+
+result<fetched> file::fetch(std::uint64_t offset, std::uint64_t n) const {
+  if (offset > size) return fail("read starts past the end of the file");
+  n = std::min(n, size - offset);
+  fetched out;
+  if (!remote) {
+    out.view = bytes.subspan(static_cast<std::size_t>(offset), static_cast<std::size_t>(n));
+    return out;
+  }
+  out.owned.resize(static_cast<std::size_t>(n));
+  std::string err;
+  if (n != 0 && !remote->read(offset, n, out.owned.data(), err)) return fail("cannot read the file: " + err);
+  out.view = out.owned;
+  return out;
+}
+
 result<reader> reader::open(const std::filesystem::path& path, read_options options) {
   const std::string text = path.string();
-  auto m = is_s3_uri(text) ? open_s3(text) : mapped_file::open(path);
+  if (is_s3_uri(text)) {
+    auto source = open_s3_source(text);
+    if (!source) return nanom::unexpected<error>(source.error());
+    auto f = file::load_remote(std::move(*source));
+    if (!f) return nanom::unexpected<error>(f.error());
+    return make(std::move(*f), std::move(options));
+  }
+  auto m = mapped_file::open(path);
   if (!m) return nanom::unexpected<error>(m.error());
   const auto bytes = (*m)->bytes();
   auto f = file::load(std::move(*m), bytes);

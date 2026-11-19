@@ -30,8 +30,6 @@ inline status ok() { return ok_t{}; }
 class mapped_file {
  public:
   static result<std::shared_ptr<mapped_file>> open(const std::filesystem::path& path);
-  /// A file held in memory, owned by this object (an s3:// object, read whole).
-  static result<std::shared_ptr<mapped_file>> from_bytes(std::vector<std::byte> bytes);
   ~mapped_file();
   mapped_file(const mapped_file&) = delete;
   mapped_file& operator=(const mapped_file&) = delete;
@@ -41,14 +39,7 @@ class mapped_file {
   mapped_file() = default;
   const std::byte* data_ = nullptr;
   std::size_t size_ = 0;
-  bool mapped_ = false;           ///< data_ is an mmap, unmapped on destruction
-  std::vector<std::byte> owned_;  ///< data_ points into this when the file was read into memory
 };
-
-/// Whether a path names an s3:// object.
-bool is_s3_uri(const std::string& path);
-/// The s3:// object read whole into memory (s3_source.cpp; built with -DP2N_S3=ON, else an error).
-result<std::shared_ptr<mapped_file>> open_s3(const std::string& uri);
 
 /// How a Parquet physical value becomes its Arrow value.
 enum class conv : std::uint8_t {
@@ -122,10 +113,38 @@ struct anode {
   bool flat() const { return k == kind::primitive && d_enc == 0; }
 };
 
+/// A file that is not in memory: an object read by range (an s3:// object). Reads are absolute and may come from any
+/// thread; the source keeps no position.
+class byte_source {
+ public:
+  virtual ~byte_source() = default;
+  virtual std::uint64_t size() const = 0;
+  /// Exactly n bytes at offset into dst; false and `err` on a short or failed read.
+  virtual bool read(std::uint64_t offset, std::uint64_t n, std::byte* dst, std::string& err) = 0;
+  /// How much of the file's end to fetch at once: the footer, and often the metadata before it.
+  virtual std::uint64_t footer_read_size() const { return std::uint64_t{64} << 10U; }
+};
+
+/// Opens an s3:// object as a byte_source (s3_source.cpp; without -DP2N_S3 an error).
+result<std::unique_ptr<byte_source>> open_s3_source(const std::string& uri);
+
+/// Whether a path names an s3:// object.
+bool is_s3_uri(const std::string& path);
+
+/// Bytes read for one column chunk: a view of the file in memory (no copy), or a copy read from a remote object
+/// (kept in `owned`; the view points into it, so the struct must not be copied).
+struct fetched {
+  std::vector<std::byte> owned;
+  std::span<const std::byte> view;
+};
+
 class file {
  public:
   std::shared_ptr<mapped_file>     mapping;   ///< null when the caller owns the bytes
-  std::span<const std::byte>       bytes;
+  std::span<const std::byte>       bytes;     ///< the whole file when it is in memory; empty when remote
+  std::unique_ptr<byte_source>     remote;    ///< the object when the file is remote; null when in memory
+  std::uint64_t                    size = 0;  ///< file size in bytes
+  std::vector<std::byte>           footer;    ///< remote: the tail holding the footer; the metadata's views point in it
   pq::FileMetaData                 meta;
   std::vector<pq::RowGroup>        row_groups;
   std::vector<leaf>                leaves;
@@ -133,7 +152,11 @@ class file {
   std::vector<anode>               top;       ///< one per top-level column
 
   static result<std::shared_ptr<file>> load(std::shared_ptr<mapped_file> mapping, std::span<const std::byte> bytes);
-  nanom::input input() const { return nanom::from(bytes); }
+  /// A remote file: reads its footer from the tail, then its structure. Column data is fetched per chunk.
+  static result<std::shared_ptr<file>> load_remote(std::unique_ptr<byte_source> source);
+  /// The bytes [offset, offset + n), clamped to the file's end.
+  result<fetched> fetch(std::uint64_t offset, std::uint64_t n) const;
+  nanom::input input() const { return nanom::from(remote ? std::span<const std::byte>(footer) : bytes); }
 };
 
 /// Resolve the leaf/top-level structure and Arrow mappings from the flattened Parquet schema.

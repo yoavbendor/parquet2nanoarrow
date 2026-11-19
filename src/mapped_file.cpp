@@ -32,22 +32,13 @@ result<std::shared_ptr<mapped_file>> mapped_file::open(const std::filesystem::pa
       return fail("cannot map " + path.string() + ": " + std::strerror(e));
     }
     m->data_ = static_cast<const std::byte*>(p);
-    m->mapped_ = true;
   }
   ::close(fd);  // the mapping stays valid without the descriptor
   return m;
 }
 
-result<std::shared_ptr<mapped_file>> mapped_file::from_bytes(std::vector<std::byte> bytes) {
-  std::shared_ptr<mapped_file> m(new mapped_file());
-  m->owned_ = std::move(bytes);  // moving keeps the buffer's address
-  m->data_ = m->owned_.data();
-  m->size_ = m->owned_.size();
-  return m;
-}
-
 mapped_file::~mapped_file() {
-  if (mapped_ && data_) ::munmap(const_cast<std::byte*>(data_), size_);
+  if (data_) ::munmap(const_cast<std::byte*>(data_), size_);
 }
 
 }  // namespace p2n

@@ -172,20 +172,20 @@ class chunk_decoder {
     if (md.dictionary_page_offset->has_value() && **md.dictionary_page_offset > 0 &&
         **md.dictionary_page_offset < start)
       start = **md.dictionary_page_offset;
-    std::int64_t len = *md.total_compressed_size;
-    const std::uint64_t fsize = f_.bytes.size();
-    if (start < 0 || len < 0 || std::uint64_t(start) > fsize || std::uint64_t(len) > fsize - std::uint64_t(start))
+    const std::int64_t len = *md.total_compressed_size;
+    if (start < 0 || len < 0 || std::uint64_t(start) > f_.size || std::uint64_t(len) > f_.size - std::uint64_t(start))
       return fail("column chunk byte range lies outside the file");
-    // PARQUET-816: some writers left the dictionary page header out of total_compressed_size.
-    // Allow a bounded overrun (as Arrow does); pages are still bounds-checked against the file and
-    // decoding stops at the declared value count, so a well-formed chunk is unaffected.
-    len += std::int64_t(std::min<std::uint64_t>(100, fsize - std::uint64_t(start) - std::uint64_t(len)));
+    // The chunk's bytes, from its first page. PARQUET-816: some writers left the dictionary page header out of
+    // total_compressed_size, so allow a bounded overrun (as Arrow does); pages are still bounds-checked against the
+    // bytes, and decoding stops at the declared value count, so a well-formed chunk is unaffected.
+    auto chunk_bytes = f_.fetch(std::uint64_t(start), std::uint64_t(len) + 100);
+    if (!chunk_bytes) return fail(chunk_bytes.error().message);
+    win_ = std::move(*chunk_bytes);
 
     auto st = init_output();
     if (!st) return st;
-    const nanom::input whole = f_.input();
-    nanom::input cur = whole.advance(std::size_t(start));
-    cur = cur.with_range(cur.first, cur.first + len);
+    const nanom::input whole = nanom::from(win_.view);
+    nanom::input cur = whole;
     while (entries_ < target_) {
       if (cur.empty())
         return fail("column chunk ended after " + std::to_string(entries_) + " of " + std::to_string(target_) + " values");
@@ -769,6 +769,7 @@ class chunk_decoder {
   }
 
   const file& f_;
+  fetched win_;  ///< the chunk's bytes, read by run(); the pages are decoded from them
   const leaf& l_;
   const read_options& opt_;
   ArrowArray* out_;
