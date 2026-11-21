@@ -28,11 +28,14 @@ if not prefix.startswith("s3://"):
     sys.exit(77)
 
 
-def read_p2n(lib, path):
+def read_p2n(lib, path, columns=None):
     stream = ffi.new("struct ArrowArrayStream*")
     addr = int(ffi.cast("uintptr_t", stream))
     err = ctypes.create_string_buffer(4096)
-    rc = lib.p2n_open_stream(path.encode(), None, 0, 1, addr, err, len(err))
+    cols = None
+    if columns:
+        cols = (ctypes.c_char_p * len(columns))(*[c.encode() for c in columns])
+    rc = lib.p2n_open_stream(path.encode(), cols, len(columns or []), 1, addr, err, len(err))
     if rc != 0:
         raise RuntimeError(err.value.decode())
     return pa.RecordBatchReader._import_from_c(addr).read_all()
@@ -84,6 +87,11 @@ def main():
             from_s3 = read_p2n(lib, f"s3://{bucket}/{obj}")
             assert from_local.equals(want), f"{name}: local read differs from pyarrow"
             assert from_s3.equals(want), f"{name}: s3 read differs from pyarrow"
+            # Projections: adjacent columns (one range request per row group) and a sparse pick out of many
+            # (one request per column chunk). Both must equal pyarrow's read of the same columns.
+            picks = ["name", "score"] if name == "sample" else ["c0001", "c1000"]
+            s3_part = read_p2n(lib, f"s3://{bucket}/{obj}", picks)
+            assert s3_part.equals(pq.read_table(local, columns=picks)), f"{name}: projected s3 read differs"
             print(f"s3 read {name}: {from_s3.num_rows} rows x {from_s3.num_columns} columns in "
                   f"{pq.ParquetFile(local).num_row_groups} row groups, identical to the local read")
 

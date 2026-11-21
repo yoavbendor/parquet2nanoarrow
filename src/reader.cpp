@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <optional>
 #include <system_error>
 #include <thread>
@@ -182,15 +183,37 @@ status reader::schema(ArrowSchema* out) const {
 
 const anode* reader::column_node(std::size_t i) const { return &file_->top[top_index_[i]]; }
 
+// Reads the bytes of the given chunks of a row group in one range when they are close together (their range is at
+// most twice their bytes); returns nothing otherwise, so each chunk is read by its own request.
+result<std::optional<prefetched>> prefetch_chunks(const file& f, const std::vector<pq::ColumnChunk>& chunks,
+                                                  const std::vector<std::size_t>& ids) {
+  std::uint64_t lo = std::numeric_limits<std::uint64_t>::max(), hi = 0, sum = 0;
+  for (const std::size_t id : ids) {
+    std::uint64_t s = 0, n = 0;
+    auto r = chunk_range(f, chunks[id], s, n);
+    if (!r) return nanom::unexpected<error>(r.error());
+    lo = std::min(lo, s);
+    hi = std::max(hi, s + n);
+    sum += n;
+  }
+  if (ids.empty() || hi <= lo || hi - lo > 2 * sum) return std::optional<prefetched>{};
+  auto bytes = f.fetch(lo, hi - lo);
+  if (!bytes) return nanom::unexpected<error>(bytes.error());
+  prefetched p;
+  p.base = lo;
+  p.bytes = std::move(*bytes);
+  return std::optional<prefetched>(std::move(p));
+}
+
 status reader::decode_leaves(const anode& n, const std::vector<pq::ColumnChunk>& chunks, std::int64_t rows,
-                             std::vector<leaf_levels>& levels, ArrowArray* arr) const {
+                             std::vector<leaf_levels>& levels, ArrowArray* arr, const prefetched* pre) const {
   if (n.k == anode::kind::primitive) {
     const leaf& l = file_->leaves[std::size_t(n.leaf)];
     return read_column_chunk(*file_, l, chunks[std::size_t(l.index)], rows, n.d_enc, &levels[std::size_t(l.index)],
-                             options_, arr);
+                             options_, arr, pre);
   }
   for (std::size_t c = 0; c < n.children.size(); ++c) {
-    auto st = decode_leaves(n.children[c], chunks, rows, levels, arr->children[c]);
+    auto st = decode_leaves(n.children[c], chunks, rows, levels, arr->children[c], pre);
     if (!st) return st;
   }
   return ok();
@@ -221,17 +244,34 @@ status reader::read_row_group(std::size_t index, ArrowArray* out) const {
     return fail(std::string("cannot allocate the output array: ") + aerr.message);
   }
   sch.release(&sch);
+  // Remote file: the chunks this read decodes are fetched together, in one range, when that range is at most twice
+  // their bytes; otherwise each chunk is fetched by its own request.
+  std::optional<prefetched> group;
+  if (file_->remote) {
+    std::vector<std::size_t> needed;
+    for (std::size_t i = 0; i < columns_.size(); ++i) {
+      std::vector<const anode*> leaves;
+      column_node(i)->leaves(leaves);
+      for (const anode* a : leaves) needed.push_back(std::size_t(file_->leaves[std::size_t(a->leaf)].index));
+    }
+    auto g = prefetch_chunks(*file_, *chunks, needed);
+    if (!g) return nanom::unexpected<error>(g.error());
+    group = std::move(*g);
+  }
+  const prefetched* pre = group ? &*group : nullptr;
+
   // Output columns are independent: each is decoded into its own child array, by one thread.
   // Workers take the next column from a shared counter; the first failing column (by index) wins.
   const auto decode_column = [&](std::size_t i, std::vector<leaf_levels>& levels) -> status {
     const anode& n = *column_node(i);
     if (n.flat()) {
       const leaf& l = file_->leaves[std::size_t(n.leaf)];
-      return read_column_chunk(*file_, l, (*chunks)[std::size_t(l.index)], rows, 0, nullptr, options_, out->children[i]);
+      return read_column_chunk(*file_, l, (*chunks)[std::size_t(l.index)], rows, 0, nullptr, options_, out->children[i],
+                               pre);
     }
     // nested: decode every leaf below (keeping its levels), then assemble the structure
     levels.assign(file_->leaves.size(), {});
-    auto s = decode_leaves(n, *chunks, rows, levels, out->children[i]);
+    auto s = decode_leaves(n, *chunks, rows, levels, out->children[i], pre);
     if (s) s = assemble_nested(*file_, n, levels, rows, out->children[i]);
     return s;
   };

@@ -138,6 +138,17 @@ struct fetched {
   std::span<const std::byte> view;
 };
 
+/// The bytes of several column chunks of one row group, read by one range (remote files): chunk bytes start at
+/// file offset `base` inside `bytes.view`.
+struct prefetched {
+  std::uint64_t base = 0;
+  fetched bytes;
+};
+
+/// The byte range of a column chunk: from its first page, and up to 100 bytes past its declared end (PARQUET-816),
+/// clamped to the file. An error when the chunk is not readable from this file.
+status chunk_range(const file& f, const pq::ColumnChunk& chunk, std::uint64_t& start, std::uint64_t& n);
+
 class file {
  public:
   std::shared_ptr<mapped_file>     mapping;   ///< null when the caller owns the bytes
@@ -178,7 +189,8 @@ struct leaf_levels {
 ///   nested leaf:  slots are the level entries with def >= d_enc; every entry's rep/def levels are
 ///                 appended to `keep` for the structural assembly.
 status read_column_chunk(const file& f, const leaf& l, const pq::ColumnChunk& chunk, std::int64_t rows,
-                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out);
+                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out,
+                         const prefetched* pre = nullptr);
 
 /// Fill the struct / list / map arrays of a nested column from its leaves' levels (the leaf arrays
 /// are already decoded). `rows` is the row group's row count.

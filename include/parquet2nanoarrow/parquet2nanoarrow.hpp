@@ -31,6 +31,8 @@
 
 namespace p2n {
 
+struct prefetched;  // internal (internal.hpp): the bytes of a row group's chunks, read together
+
 struct error {
   std::string message;
 };
@@ -100,7 +102,8 @@ class reader {
   static result<reader> make(std::shared_ptr<const file> f, read_options options);
   const anode* column_node(std::size_t i) const;
   status decode_leaves(const anode& n, const std::vector<nanom_formats::parquet::ColumnChunk>& chunks,
-                       std::int64_t rows, std::vector<leaf_levels>& levels, ArrowArray* arr) const;
+                       std::int64_t rows, std::vector<leaf_levels>& levels, ArrowArray* arr,
+                       const prefetched* pre) const;
   std::shared_ptr<const file> file_;
   std::vector<column_info> columns_;
   std::vector<std::size_t> top_index_;  ///< per output column: its top-level schema node
