@@ -142,8 +142,8 @@ status decompress(CompressionCodec codec, bytes_span in, std::size_t out_size, s
 class chunk_decoder {
  public:
   chunk_decoder(const file& f, const leaf& l, const read_options& opt, ArrowArray* out, std::int64_t rows,
-                std::int16_t d_enc, leaf_levels* keep)
-      : f_(f), l_(l), opt_(opt), out_(out), rows_(rows), d_enc_(d_enc), keep_(keep) {}
+                std::int16_t d_enc, leaf_levels* keep, const prefetched* pre)
+      : f_(f), l_(l), opt_(opt), out_(out), rows_(rows), d_enc_(d_enc), keep_(keep), pre_(pre) {}
 
   status run(const pq::ColumnChunk& chunk) {
     if (!chunk.meta_data->has_value()) return fail("column chunk without metadata (encrypted or external)");
@@ -168,24 +168,21 @@ class chunk_decoder {
     }
     codec_ = *md.codec;
 
-    std::int64_t start = *md.data_page_offset;
-    if (md.dictionary_page_offset->has_value() && **md.dictionary_page_offset > 0 &&
-        **md.dictionary_page_offset < start)
-      start = **md.dictionary_page_offset;
-    std::int64_t len = *md.total_compressed_size;
-    const std::uint64_t fsize = f_.bytes.size();
-    if (start < 0 || len < 0 || std::uint64_t(start) > fsize || std::uint64_t(len) > fsize - std::uint64_t(start))
-      return fail("column chunk byte range lies outside the file");
-    // PARQUET-816: some writers left the dictionary page header out of total_compressed_size.
-    // Allow a bounded overrun (as Arrow does); pages are still bounds-checked against the file and
-    // decoding stops at the declared value count, so a well-formed chunk is unaffected.
-    len += std::int64_t(std::min<std::uint64_t>(100, fsize - std::uint64_t(start) - std::uint64_t(len)));
+    std::uint64_t start = 0, want = 0;
+    auto range = chunk_range(f_, chunk, start, want);
+    if (!range) return range;
+    if (pre_ && start >= pre_->base && start + want <= pre_->base + pre_->bytes.view.size()) {
+      win_.view = pre_->bytes.view.subspan(std::size_t(start - pre_->base), std::size_t(want));  // already read
+    } else {
+      auto chunk_bytes = f_.fetch(start, want);
+      if (!chunk_bytes) return fail(chunk_bytes.error().message);
+      win_ = std::move(*chunk_bytes);
+    }
 
     auto st = init_output();
     if (!st) return st;
-    const nanom::input whole = f_.input();
-    nanom::input cur = whole.advance(std::size_t(start));
-    cur = cur.with_range(cur.first, cur.first + len);
+    const nanom::input whole = nanom::from(win_.view);
+    nanom::input cur = whole;
     while (entries_ < target_) {
       if (cur.empty())
         return fail("column chunk ended after " + std::to_string(entries_) + " of " + std::to_string(target_) + " values");
@@ -769,6 +766,8 @@ class chunk_decoder {
   }
 
   const file& f_;
+  const prefetched* pre_;  ///< the row group's bytes when they were read together (remote files), else null
+  fetched win_;            ///< the chunk's bytes: a view of pre_, or read by run(); the pages are decoded from them
   const leaf& l_;
   const read_options& opt_;
   ArrowArray* out_;
@@ -825,9 +824,26 @@ class chunk_decoder {
 
 }  // namespace
 
+status chunk_range(const file& f, const pq::ColumnChunk& chunk, std::uint64_t& start, std::uint64_t& n) {
+  if (!chunk.meta_data->has_value()) return fail("column chunk without metadata (encrypted or external)");
+  if (chunk.file_path->has_value()) return fail("column chunk stored in an external file is not supported");
+  const pq::ColumnMetaData& md = **chunk.meta_data;
+  std::int64_t s = *md.data_page_offset;
+  if (md.dictionary_page_offset->has_value() && **md.dictionary_page_offset > 0 &&
+      **md.dictionary_page_offset < s)
+    s = **md.dictionary_page_offset;
+  const std::int64_t len = *md.total_compressed_size;
+  if (s < 0 || len < 0 || std::uint64_t(s) > f.size || std::uint64_t(len) > f.size - std::uint64_t(s))
+    return fail("column chunk byte range lies outside the file");
+  start = std::uint64_t(s);
+  n = std::min<std::uint64_t>(std::uint64_t(len) + 100, f.size - start);
+  return ok();
+}
+
 status read_column_chunk(const file& f, const leaf& l, const pq::ColumnChunk& chunk, std::int64_t rows,
-                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out) {
-  chunk_decoder d(f, l, opt, out, rows, d_enc, keep);
+                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out,
+                         const prefetched* pre) {
+  chunk_decoder d(f, l, opt, out, rows, d_enc, keep, pre);
   auto st = d.run(chunk);
   if (!st) return fail("column '" + l.name + "': " + st.error().message);
   return st;

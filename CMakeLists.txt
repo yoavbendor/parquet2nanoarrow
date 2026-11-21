@@ -98,7 +98,8 @@ add_library(parquet2nanoarrow STATIC
     src/schema.cpp
     src/column_reader.cpp
     src/nested.cpp
-    src/reader.cpp)
+    src/reader.cpp
+    src/s3_source.cpp)
 add_library(parquet2nanoarrow::parquet2nanoarrow ALIAS parquet2nanoarrow)
 target_include_directories(parquet2nanoarrow PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -115,6 +116,35 @@ target_compile_options(parquet2nanoarrow PRIVATE -Wall -Wextra -Wpedantic $<$<BO
 # with ctypes (and any non-C++ consumer can use).
 add_library(parquet2nanoarrow_c SHARED src/c_api.cpp)
 target_link_libraries(parquet2nanoarrow_c PRIVATE parquet2nanoarrow)
+
+# s3:// inputs (P2N_S3=ON): nanos3reader's range source, which needs libcurl. Off by default, so the library keeps
+# no network dependency. The pin is a commit (nanos3reader's 0.6.0 range adapters); switch to its tag once it exists.
+option(P2N_S3 "Read s3:// inputs through nanos3reader (needs libcurl)" OFF)
+if(P2N_S3)
+    find_package(CURL REQUIRED)
+    set(NANOS3READER_CRYPTO bundled CACHE STRING "" FORCE)  # no OpenSSL dependency
+    set(NANOS3READER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_INTEGRATION_TESTS OFF CACHE BOOL "" FORCE)
+    set(NANOS3READER_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(nanos3reader
+        GIT_REPOSITORY https://github.com/yoavbendor/nanos3reader.git
+        GIT_TAG 65aa2e7a561a934d59b9f7c123420018502213de
+    )
+    FetchContent_MakeAvailable(nanos3reader)
+    target_compile_definitions(parquet2nanoarrow PRIVATE P2N_HAVE_S3=1)
+    target_link_libraries(parquet2nanoarrow PRIVATE nanos3reader::nanos3reader)
+    if(P2N_BUILD_TESTS)
+        # The same file read from disk and from s3:// (needs an S3 endpoint; see tests/s3_read.py).
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME s3_read
+                     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/s3_read.py $<TARGET_FILE:parquet2nanoarrow_c>)
+            set_tests_properties(s3_read PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+    endif()
+endif()
 
 if(P2N_BUILD_TESTS)
     enable_testing()

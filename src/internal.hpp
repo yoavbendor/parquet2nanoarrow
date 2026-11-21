@@ -113,10 +113,49 @@ struct anode {
   bool flat() const { return k == kind::primitive && d_enc == 0; }
 };
 
+/// A file that is not in memory: an object read by range (an s3:// object). Reads are absolute and may come from any
+/// thread; the source keeps no position.
+class byte_source {
+ public:
+  virtual ~byte_source() = default;
+  virtual std::uint64_t size() const = 0;
+  /// Exactly n bytes at offset into dst; false and `err` on a short or failed read.
+  virtual bool read(std::uint64_t offset, std::uint64_t n, std::byte* dst, std::string& err) = 0;
+  /// How much of the file's end to fetch at once: the footer, and often the metadata before it.
+  virtual std::uint64_t footer_read_size() const { return std::uint64_t{64} << 10U; }
+};
+
+/// Opens an s3:// object as a byte_source (s3_source.cpp; without -DP2N_S3 an error).
+result<std::unique_ptr<byte_source>> open_s3_source(const std::string& uri);
+
+/// Whether a path names an s3:// object.
+bool is_s3_uri(const std::string& path);
+
+/// Bytes read for one column chunk: a view of the file in memory (no copy), or a copy read from a remote object
+/// (kept in `owned`; the view points into it, so the struct must not be copied).
+struct fetched {
+  std::vector<std::byte> owned;
+  std::span<const std::byte> view;
+};
+
+/// The bytes of several column chunks of one row group, read by one range (remote files): chunk bytes start at
+/// file offset `base` inside `bytes.view`.
+struct prefetched {
+  std::uint64_t base = 0;
+  fetched bytes;
+};
+
+/// The byte range of a column chunk: from its first page, and up to 100 bytes past its declared end (PARQUET-816),
+/// clamped to the file. An error when the chunk is not readable from this file.
+status chunk_range(const file& f, const pq::ColumnChunk& chunk, std::uint64_t& start, std::uint64_t& n);
+
 class file {
  public:
   std::shared_ptr<mapped_file>     mapping;   ///< null when the caller owns the bytes
-  std::span<const std::byte>       bytes;
+  std::span<const std::byte>       bytes;     ///< the whole file when it is in memory; empty when remote
+  std::unique_ptr<byte_source>     remote;    ///< the object when the file is remote; null when in memory
+  std::uint64_t                    size = 0;  ///< file size in bytes
+  std::vector<std::byte>           footer;    ///< remote: the tail holding the footer; the metadata's views point in it
   pq::FileMetaData                 meta;
   std::vector<pq::RowGroup>        row_groups;
   std::vector<leaf>                leaves;
@@ -124,7 +163,11 @@ class file {
   std::vector<anode>               top;       ///< one per top-level column
 
   static result<std::shared_ptr<file>> load(std::shared_ptr<mapped_file> mapping, std::span<const std::byte> bytes);
-  nanom::input input() const { return nanom::from(bytes); }
+  /// A remote file: reads its footer from the tail, then its structure. Column data is fetched per chunk.
+  static result<std::shared_ptr<file>> load_remote(std::unique_ptr<byte_source> source);
+  /// The bytes [offset, offset + n), clamped to the file's end.
+  result<fetched> fetch(std::uint64_t offset, std::uint64_t n) const;
+  nanom::input input() const { return nanom::from(remote ? std::span<const std::byte>(footer) : bytes); }
 };
 
 /// Resolve the leaf/top-level structure and Arrow mappings from the flattened Parquet schema.
@@ -146,7 +189,8 @@ struct leaf_levels {
 ///   nested leaf:  slots are the level entries with def >= d_enc; every entry's rep/def levels are
 ///                 appended to `keep` for the structural assembly.
 status read_column_chunk(const file& f, const leaf& l, const pq::ColumnChunk& chunk, std::int64_t rows,
-                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out);
+                         std::int16_t d_enc, leaf_levels* keep, const read_options& opt, ArrowArray* out,
+                         const prefetched* pre = nullptr);
 
 /// Fill the struct / list / map arrays of a nested column from its leaves' levels (the leaf arrays
 /// are already decoded). `rows` is the row group's row count.
