@@ -766,7 +766,6 @@ class chunk_decoder {
   }
 
   const file& f_;
-  const prefetched* pre_;  ///< the row group's bytes when they were read together (remote files), else null
   fetched win_;            ///< the chunk's bytes: a view of pre_, or read by run(); the pages are decoded from them
   const leaf& l_;
   const read_options& opt_;
@@ -774,6 +773,7 @@ class chunk_decoder {
   std::int64_t rows_;
   std::int16_t d_enc_ = 0;
   leaf_levels* keep_ = nullptr;
+  const prefetched* pre_ = nullptr;  ///< the row group's bytes when they were read together (remote files), else null
   std::int64_t cap_ = 0;       ///< value slots the output buffers hold
   std::int64_t target_ = 0;    ///< level entries (values incl. nulls) the chunk declares
   std::int64_t entries_ = 0;   ///< level entries consumed so far
